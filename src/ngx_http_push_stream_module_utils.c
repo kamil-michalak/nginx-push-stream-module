@@ -457,6 +457,11 @@ ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t
     ngx_pool_t                             *temp_pool = received_temp_pool;
 
     if ((mcf->events_channel_id.len > 0) && !channel->for_events) {
+        /* skip entirely if nobody is subscribed to the events channel */
+        if (data->events_channel == NULL || data->events_channel->subscribers == 0) {
+            return NGX_OK;
+        }
+
         if ((temp_pool == NULL) && ((temp_pool = ngx_create_pool(4096, log)) == NULL)) {
             return NGX_ERROR;
         }
@@ -550,9 +555,11 @@ ngx_http_push_stream_get_header(ngx_http_request_t *r, const ngx_str_t *header_n
         }
 
         if ((h[i].key.len == header_name->len) && (ngx_strncasecmp(h[i].key.data, header_name->data, header_name->len) == 0)) {
-            aux = ngx_http_push_stream_create_str(r->pool, h[i].value.len);
+            /* return a pointer into nginx's already-parsed header - no copy needed */
+            aux = ngx_pcalloc(r->pool, sizeof(ngx_str_t));
             if (aux != NULL) {
-                ngx_memcpy(aux->data, h[i].value.data, h[i].value.len);
+                aux->data = h[i].value.data;
+                aux->len  = h[i].value.len;
             }
             break;
         }

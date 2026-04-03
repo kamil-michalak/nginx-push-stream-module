@@ -325,6 +325,9 @@ ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_dat
 
     thisworker_data->subscribers = 0;
 
+    /* Phase 1: reset per-worker subscriber counter on each channel sentinel
+       for THIS worker only - no global channel lock needed since we own
+       the sentinel for our pid */
     ngx_shmtx_lock(&data->channels_queue_mutex);
     for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
         ngx_http_push_stream_channel_t *channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
@@ -339,6 +342,8 @@ ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_dat
     }
     ngx_shmtx_unlock(&data->channels_queue_mutex);
 
+    /* Phase 2: walk our local subscribers list (no shared lock needed -
+       subscribers_queue is worker-local) and increment counts */
     for (q = ngx_queue_head(&thisworker_data->subscribers_queue); q != ngx_queue_sentinel(&thisworker_data->subscribers_queue); q = ngx_queue_next(q)) {
         ngx_http_push_stream_subscriber_t *subscriber = ngx_queue_data(q, ngx_http_push_stream_subscriber_t, worker_queue);
 
@@ -353,25 +358,33 @@ ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_dat
     data->slots_for_census--;
     ngx_shmtx_unlock(&shpool->mutex);
 
+    /* Phase 3: last worker to finish census aggregates global totals.
+       Only holds channels_queue_mutex briefly to sum already-updated
+       per-worker counters - no per-channel inner loop needed. */
     if (data->slots_for_census == 0) {
+        ngx_uint_t total_subs = 0;
+
         ngx_shmtx_lock(&shpool->mutex);
-        data->subscribers = 0;
         for (i = 0; i < NGX_MAX_PROCESSES; i++) {
             if (data->ipc[i].pid > 0) {
-                data->subscribers += data->ipc[i].subscribers;
+                total_subs += data->ipc[i].subscribers;
             }
         }
+        data->subscribers = total_subs;
         ngx_shmtx_unlock(&shpool->mutex);
 
+        /* update per-channel subscriber counts by summing the per-worker
+           sentinels that were already refreshed above by each worker */
         ngx_shmtx_lock(&data->channels_queue_mutex);
         for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
             ngx_http_push_stream_channel_t *channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
+            ngx_uint_t ch_subs = 0;
             ngx_shmtx_lock(channel->mutex);
-            channel->subscribers = 0;
             for (cur_worker = ngx_queue_head(&channel->workers_with_subscribers); cur_worker != ngx_queue_sentinel(&channel->workers_with_subscribers); cur_worker = ngx_queue_next(cur_worker)) {
                 ngx_http_push_stream_pid_queue_t *worker = ngx_queue_data(cur_worker, ngx_http_push_stream_pid_queue_t, queue);
-                channel->subscribers += worker->subscribers;
+                ch_subs += worker->subscribers;
             }
+            channel->subscribers = ch_subs;
             ngx_shmtx_unlock(channel->mutex);
         }
         ngx_shmtx_unlock(&data->channels_queue_mutex);
@@ -469,20 +482,30 @@ ngx_http_push_stream_broadcast(ngx_http_push_stream_channel_t *channel, ngx_http
     // in shared memory, identified by pid.
     ngx_http_push_stream_pid_queue_t        *worker;
     ngx_queue_t                             *q;
-    ngx_flag_t                               queue_was_empty[NGX_MAX_PROCESSES];
+
+    /* collect workers that need an IPC alert (queue was empty before our message)
+       in a small stack array - avoids a second iteration over the channel queue */
+    struct { ngx_pid_t pid; ngx_int_t slot; } to_alert[NGX_MAX_PROCESSES];
+    ngx_int_t alert_count = 0;
 
     ngx_shmtx_lock(channel->mutex);
     for (q = ngx_queue_head(&channel->workers_with_subscribers); q != ngx_queue_sentinel(&channel->workers_with_subscribers); q = ngx_queue_next(q)) {
+        ngx_flag_t queue_was_empty = 0;
         worker = ngx_queue_data(q, ngx_http_push_stream_pid_queue_t, queue);
-        ngx_http_push_stream_send_worker_message(channel, &worker->subscriptions, worker->pid, worker->slot, msg, &queue_was_empty[worker->slot], log, mcf);
+        ngx_http_push_stream_send_worker_message(channel, &worker->subscriptions, worker->pid, worker->slot, msg, &queue_was_empty, log, mcf);
+        if (queue_was_empty) {
+            to_alert[alert_count].pid  = worker->pid;
+            to_alert[alert_count].slot = worker->slot;
+            alert_count++;
+        }
     }
     ngx_shmtx_unlock(channel->mutex);
 
-    for (q = ngx_queue_head(&channel->workers_with_subscribers); q != ngx_queue_sentinel(&channel->workers_with_subscribers); q = ngx_queue_next(q)) {
-        worker = ngx_queue_data(q, ngx_http_push_stream_pid_queue_t, queue);
-        // interprocess communication breakdown
-        if (queue_was_empty[worker->slot] && (ngx_http_push_stream_alert_worker_check_messages(worker->pid, worker->slot, log) != NGX_OK)) {
-            ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: error communicating with worker process, pid: %P, slot: %d", worker->pid, worker->slot);
+    /* send IPC alerts outside the lock */
+    ngx_int_t i;
+    for (i = 0; i < alert_count; i++) {
+        if (ngx_http_push_stream_alert_worker_check_messages(to_alert[i].pid, to_alert[i].slot, log) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: error communicating with worker process, pid: %P, slot: %d", to_alert[i].pid, to_alert[i].slot);
         }
     }
 
@@ -520,7 +543,12 @@ ngx_http_push_stream_respond_to_subscribers(ngx_http_push_stream_channel_t *chan
                 } else {
                     ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(subscriber->request, ngx_http_push_stream_module);
                     ngx_http_push_stream_loc_conf_t       *pslcf = ngx_http_get_module_loc_conf(subscriber->request, ngx_http_push_stream_module);
-                    ngx_http_push_stream_timer_reset(pslcf->ping_message_interval, ctx->ping_timer);
+                    /* only reschedule ping timer if it is currently armed -
+                       a message was just delivered so the client is alive,
+                       we just push the deadline further out */
+                    if ((ctx->ping_timer != NULL) && ctx->ping_timer->timer_set) {
+                        ngx_http_push_stream_timer_reset(pslcf->ping_message_interval, ctx->ping_timer);
+                    }
                 }
             }
         }
