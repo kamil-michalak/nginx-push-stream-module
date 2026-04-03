@@ -83,6 +83,20 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+#if (NGX_HAVE_ZLIB)
+    /* detect permessage-deflate offer from client */
+    ctx->deflate_enabled = 0;
+    {
+        ngx_str_t *ext_header = ngx_http_push_stream_get_header(r, (ngx_str_t *) &NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS);
+        if (ext_header != NULL &&
+            ngx_strnstr(ext_header->data, "permessage-deflate", ext_header->len) != NULL) {
+            ctx->deflate_enabled = 1;
+        }
+    }
+#else
+    ctx->deflate_enabled = 0;
+#endif
+
     if ((ctx->frame = ngx_pcalloc(r->pool, sizeof(ngx_http_push_stream_frame_t))) == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to create frame structure");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -102,6 +116,13 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     ngx_http_push_stream_add_response_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_UPGRADE, &NGX_HTTP_PUSH_STREAM_WEBSOCKET_UPGRADE);
     ngx_http_push_stream_add_response_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_CONNECTION, &NGX_HTTP_PUSH_STREAM_WEBSOCKET_CONNECTION);
     ngx_http_push_stream_add_response_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_ACCEPT, sec_accept_header);
+#if (NGX_HAVE_ZLIB)
+    if (ctx->deflate_enabled) {
+        ngx_http_push_stream_add_response_header(r,
+            (ngx_str_t *) &NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS,
+            (ngx_str_t *) &NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE);
+    }
+#endif
     r->headers_out.status_line = NGX_HTTP_PUSH_STREAM_101_STATUS_LINE;
 
     ngx_http_push_stream_send_only_added_headers(r);
