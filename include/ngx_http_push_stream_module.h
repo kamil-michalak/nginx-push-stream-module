@@ -31,6 +31,14 @@
 #include <ngx_http.h>
 #include <nginx.h>
 
+#if (NGX_HAVE_ZLIB)
+#include <zlib.h>
+#endif
+
+/* minimum payload size (bytes) worth compressing - frames smaller than this
+   are sent as-is even to deflate-enabled clients */
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN 200
+
 typedef struct {
     ngx_queue_t                     queue;
     ngx_regex_t                    *agent;
@@ -147,6 +155,7 @@ struct ngx_http_push_stream_msg_s {
     ngx_str_t                      *event_id_message;
     ngx_str_t                      *event_type_message;
     ngx_str_t                      *formatted_messages;
+    ngx_str_t                      *compressed_messages;  /* deflated WS frames, NULL per slot if not worth compressing */
     ngx_int_t                       workers_ref_count;
     ngx_uint_t                      qtd_templates;
 };
@@ -243,6 +252,7 @@ typedef struct {
     ngx_str_t                          *callback;
     ngx_http_push_stream_requested_channel_t *requested_channels;
     ngx_http_push_stream_frame_t       *frame;
+    ngx_flag_t                          deflate_enabled;  /* permessage-deflate negotiated */
 } ngx_http_push_stream_module_ctx_t;
 
 // messages to worker processes
@@ -410,11 +420,16 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_MODE_WEBSOCKET   = ngx_string("webs
 #define NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_OPCODE  0xA
 
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE    =  NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4);
+/* same as TEXT_LAST_FRAME_BYTE but with RSV1=1 for permessage-deflate (FIN=1, RSV1=1, opcode=TEXT -> 0xC1) */
+static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_DEFLATE_BYTE = 0xC1;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_LAST_FRAME_BYTE[] = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_OPCODE | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE[]  = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE[]  = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_16_BYTE   = 126;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_64_BYTE   = 127;
+
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS  = ngx_string("Sec-WebSocket-Extensions");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE     = ngx_string("permessage-deflate; server_no_context_takeover");
 
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_REASON = ngx_string("\x03\xF0{\"http_status\": %d, \"explain\":\"%V\"}");
 
