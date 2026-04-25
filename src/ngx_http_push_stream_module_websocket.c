@@ -29,6 +29,146 @@ ngx_str_t *ngx_http_push_stream_generate_websocket_accept_value(ngx_http_request
 ngx_int_t  ngx_http_push_stream_recv(ngx_connection_t *c, ngx_event_t *rev, ngx_buf_t *buf, ssize_t len);
 void       ngx_http_push_stream_set_buffer(ngx_buf_t *buf, u_char *start, u_char *last, ssize_t len);
 
+/* Send a JSON ACK/error frame to the client. fmt takes one %V (channel id). */
+static void
+ngx_http_push_stream_websocket_send_ack(ngx_http_request_t *r,
+    const ngx_str_t *fmt, ngx_str_t *channel_id)
+{
+    ngx_str_t *json;
+    ngx_str_t *frame;
+
+    json = ngx_http_push_stream_create_str(r->pool, fmt->len + channel_id->len);
+    if (json == NULL) {
+        return;
+    }
+    json->len = ngx_sprintf(json->data, (char *) fmt->data, channel_id) - json->data;
+
+    frame = ngx_http_push_stream_get_formatted_websocket_frame(
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE, 1,
+        json->data, json->len, r->pool);
+    if (frame != NULL) {
+        ngx_http_push_stream_send_response_text(r, frame->data, frame->len, 0);
+    }
+}
+
+
+/* Handle "+channel_name" or "+channel_name:event_id" */
+static void
+ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
+    ngx_str_t *channel_id, ngx_str_t *last_event_id)
+{
+    ngx_http_push_stream_main_conf_t    *mcf   = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_loc_conf_t     *cf    = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_module_ctx_t   *ctx   = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+    ngx_slab_pool_t                     *shpool = mcf->shpool;
+    ngx_http_push_stream_channel_t      *channel;
+    ngx_http_push_stream_subscription_t *subscription;
+    ngx_queue_t                         *q;
+
+    /* check max channels per connection limit before touching shared memory */
+    if (cf->websocket_max_channels_per_connection != NGX_CONF_UNSET_UINT) {
+        ngx_uint_t  current = 0;
+        ngx_queue_t *qi;
+        for (qi = ngx_queue_head(&ctx->subscriber->subscriptions);
+             qi != ngx_queue_sentinel(&ctx->subscriber->subscriptions);
+             qi = ngx_queue_next(qi)) {
+            current++;
+        }
+        if (current >= cf->websocket_max_channels_per_connection) {
+            ngx_http_push_stream_websocket_send_ack(r,
+                &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_PER_CONN, channel_id);
+            return;
+        }
+    }
+
+    /* find existing channel - do NOT create */
+    channel = ngx_http_push_stream_find_channel(channel_id, r->connection->log, mcf);
+    if (channel == NULL) {
+        ngx_http_push_stream_websocket_send_ack(r,
+            &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND, channel_id);
+        return;
+    }
+
+    /* check not already subscribed to this channel */
+    for (q = ngx_queue_head(&ctx->subscriber->subscriptions);
+         q != ngx_queue_sentinel(&ctx->subscriber->subscriptions);
+         q = ngx_queue_next(q)) {
+        subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
+        if (subscription->channel == channel) {
+            ngx_http_push_stream_websocket_send_ack(r,
+                &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_ALREADY_SUB, channel_id);
+            return;
+        }
+    }
+
+    /* check per-channel subscriber limit */
+    if (cf->max_subscribers_per_channel != NGX_CONF_UNSET_UINT
+        && channel->subscribers >= cf->max_subscribers_per_channel) {
+        ngx_http_push_stream_websocket_send_ack(r,
+            &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_CHANNELS, channel_id);
+        return;
+    }
+
+    subscription = ngx_http_push_stream_create_channel_subscription(r, channel, ctx->subscriber);
+    if (subscription == NULL) {
+        return;
+    }
+
+    /* deliver history before registering to avoid double-delivery */
+    if (last_event_id != NULL && last_event_id->len > 0) {
+        ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
+    }
+
+    if (ngx_http_push_stream_assing_subscription_to_channel(
+            shpool, channel, subscription,
+            &ctx->subscriber->subscriptions, r->connection->log) == NGX_OK) {
+        ngx_http_push_stream_websocket_send_ack(r,
+            &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED, channel_id);
+    }
+}
+
+
+/* Handle "-channel_name" */
+static void
+ngx_http_push_stream_websocket_handle_unsubscribe(ngx_http_request_t *r,
+    ngx_str_t *channel_id)
+{
+    ngx_http_push_stream_main_conf_t    *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_module_ctx_t   *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_subscription_t *subscription;
+    ngx_queue_t                         *q;
+
+    for (q = ngx_queue_head(&ctx->subscriber->subscriptions);
+         q != ngx_queue_sentinel(&ctx->subscriber->subscriptions);
+         q = ngx_queue_next(q)) {
+        subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
+
+        if (subscription->channel->id.len == channel_id->len
+            && ngx_memcmp(subscription->channel->id.data,
+                          channel_id->data, channel_id->len) == 0) {
+
+            ngx_shmtx_lock(subscription->channel->mutex);
+            NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(subscription->channel->subscribers);
+            NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(subscription->channel_worker_sentinel->subscribers);
+            ngx_queue_remove(&subscription->channel_worker_queue);
+            ngx_queue_remove(&subscription->queue);
+            ngx_shmtx_unlock(subscription->channel->mutex);
+
+            ngx_http_push_stream_send_event(mcf, r->connection->log,
+                subscription->channel,
+                &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED,
+                r->pool);
+
+            ngx_http_push_stream_websocket_send_ack(r,
+                &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_UNSUBSCRIBED, channel_id);
+            return;
+        }
+    }
+
+    ngx_http_push_stream_websocket_send_ack(r,
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_SUB, channel_id);
+}
+
 static ngx_int_t
 ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
 {
@@ -364,21 +504,75 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         }
                     }
 
-                    if (cf->websocket_allow_publish && ctx->frame->last_fragment && (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_OPCODE)) {
-                        for (q = ngx_queue_head(&ctx->subscriber->subscriptions); q != ngx_queue_sentinel(&ctx->subscriber->subscriptions); q = ngx_queue_next(q)) {
-                            ngx_http_push_stream_subscription_t *subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
-                            if (subscription->channel->for_events) {
-                                // skip events channel on publish by websocket connections
-                                continue;
+                    if (ctx->frame->last_fragment && (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_OPCODE) && ctx->frame->payload_len > 1) {
+                        u_char cmd = ctx->frame->payload[0];
+
+                        /* dynamic subscribe/unsubscribe - independent of allow_publish */
+                        if (cf->websocket_allow_resubscribe
+                            && (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE
+                                || cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE)) {
+
+                            u_char    *body     = ctx->frame->payload + 1;
+                            size_t     body_len = ctx->frame->payload_len - 1;
+                            ngx_str_t  channel_id;
+                            ngx_str_t  event_id  = ngx_null_string;
+
+                            if (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE) {
+                                /* split "channel_name:event_id" on first ':' */
+                                u_char *sep = ngx_strlchr(body, body + body_len,
+                                    NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SEPARATOR);
+                                if (sep != NULL) {
+                                    channel_id.data = body;
+                                    channel_id.len  = sep - body;
+                                    event_id.data   = sep + 1;
+                                    event_id.len    = body_len - channel_id.len - 1;
+                                } else {
+                                    channel_id.data = body;
+                                    channel_id.len  = body_len;
+                                }
+                            } else {
+                                channel_id.data = body;
+                                channel_id.len  = body_len;
                             }
 
-                            if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, cf->store_messages, ctx->temp_pool) != NGX_OK) {
-                                goto finalize;
+                            /* validate channel_id before touching any shared state:
+                               - empty name (bare '+' or '-')
+                               - exceeds max_channel_id_length */
+                            if (channel_id.len == 0) {
+                                goto next_frame;
+                            }
+                            if ((cf->max_channel_id_length != NGX_CONF_UNSET_UINT)
+                                && (channel_id.len > cf->max_channel_id_length)) {
+                                ngx_http_push_stream_websocket_send_ack(r,
+                                    &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND, &channel_id);
+                                goto next_frame;
+                            }
+
+                            if (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE) {
+                                ngx_http_push_stream_websocket_handle_subscribe(r, &channel_id,
+                                    (event_id.len > 0) ? &event_id : NULL);
+                            } else {
+                                ngx_http_push_stream_websocket_handle_unsubscribe(r, &channel_id);
+                            }
+
+                        /* normal publish to all subscribed channels */
+                        } else if (cf->websocket_allow_publish
+                                   && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE
+                                   && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE) {
+                            for (q = ngx_queue_head(&ctx->subscriber->subscriptions); q != ngx_queue_sentinel(&ctx->subscriber->subscriptions); q = ngx_queue_next(q)) {
+                                ngx_http_push_stream_subscription_t *subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
+                                if (subscription->channel->for_events) {
+                                    continue;
+                                }
+                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, cf->store_messages, ctx->temp_pool) != NGX_OK) {
+                                    goto finalize;
+                                }
                             }
                         }
                     }
                 }
 
+                next_frame:
                 if (ctx->frame->last_fragment) {
                     ctx->frame->last_fragment = 0;
                     ctx->frame->fragmented = 0;
