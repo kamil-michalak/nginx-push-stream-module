@@ -102,8 +102,8 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     }
 
     /* check per-channel subscriber limit */
-    if (cf->max_subscribers_per_channel != NGX_CONF_UNSET_UINT
-        && channel->subscribers >= cf->max_subscribers_per_channel) {
+    if (mcf->max_subscribers_per_channel != NGX_CONF_UNSET_UINT
+        && channel->subscribers >= mcf->max_subscribers_per_channel) {
         ngx_http_push_stream_websocket_send_ack(r,
             &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_CHANNELS, channel_id);
         return;
@@ -541,8 +541,8 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                             if (channel_id.len == 0) {
                                 goto next_frame;
                             }
-                            if ((cf->max_channel_id_length != NGX_CONF_UNSET_UINT)
-                                && (channel_id.len > cf->max_channel_id_length)) {
+                            if ((mcf->max_channel_id_length != NGX_CONF_UNSET_UINT)
+                                && (channel_id.len > mcf->max_channel_id_length)) {
                                 ngx_http_push_stream_websocket_send_ack(r,
                                     &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND, &channel_id);
                                 goto next_frame;
