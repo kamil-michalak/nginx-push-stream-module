@@ -554,10 +554,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
 
                     if (!ngx_http_push_stream_is_utf8(ctx->frame->payload, ctx->frame->payload_len)) {
                         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                            "push stream module: ws_reading finalizing: payload failed UTF-8 check len=%ui byte0=0x%02uxd",
+                            "push stream module: ws_reading: payload failed UTF-8 check len=%ui byte0=0x%02uxd - skipping frame",
                             ctx->frame->payload_len,
                             (ctx->frame->payload_len > 0) ? (unsigned int)ctx->frame->payload[0] : 0);
-                        goto finalize;
+                        goto next_frame;
                     }
 
                     if (ctx->frame->fragmented) {
