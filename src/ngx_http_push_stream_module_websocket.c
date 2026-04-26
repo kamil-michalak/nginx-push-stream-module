@@ -625,6 +625,12 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     ngx_str_set(&ctx->frame->consolidated, "");
 
                     if (ctx->temp_pool != NULL) {
+                        /* payload was allocated from temp_pool - must clear buf pointers
+                           BEFORE destroying the pool to avoid use-after-free: on the next
+                           websocket_reading call line 378 reuses ctx->frame->buf.start which
+                           would point into freed memory and corrupt frame state */
+                        ctx->frame->payload = NULL;
+                        ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->header, NULL, 8);
                         ngx_destroy_pool(ctx->temp_pool);
                         ctx->temp_pool = NULL;
                     }
