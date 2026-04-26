@@ -117,9 +117,6 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     /* deliver history before registering to avoid double-delivery */
     if (last_event_id != NULL && last_event_id->len > 0) {
         ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
-        /* output_filter may overwrite write_event_handler with flush_pending_output
-           when the send buffer fills up - restore it so WebSocket reading keeps working */
-        r->write_event_handler = ngx_http_push_stream_websocket_reading;
     }
 
     if (ngx_http_push_stream_assing_subscription_to_channel(
@@ -286,9 +283,23 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     // matching the channel order in the subscription path
     event_id_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
     channel_index  = 0;
+
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+        "push stream module: WS connect last_event_id=\"%V\" parts=%ui",
+        (last_event_id != NULL) ? last_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY,
+        (event_id_parts != NULL) ? event_id_parts->nelts : 0);
+
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+        ngx_str_t *ch_event_id;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "push stream module: WS connect channel[%ui]=\"%V\" event_id=\"%V\"",
+            channel_index,
+            requested_channel->id,
+            (ch_event_id != NULL) ? ch_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY);
+        channel_index++;
+        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ch_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
             return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
         }
     }
@@ -582,6 +593,11 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                 }
 
                 next_frame:
+                /* always restore the websocket read handler after any frame processing.
+                   send_old_messages, send_ack, or any other output_filter call may
+                   overwrite write_event_handler with flush_pending_output when the
+                   send buffer is full. Restore here so the connection stays alive. */
+                r->write_event_handler = ngx_http_push_stream_websocket_reading;
                 if (ctx->frame->last_fragment) {
                     ctx->frame->last_fragment = 0;
                     ctx->frame->fragmented = 0;
