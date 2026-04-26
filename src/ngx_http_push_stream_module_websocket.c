@@ -552,6 +552,73 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         }
                     }
 
+#if (NGX_HAVE_ZLIB)
+                    /* decompress client->server frame when permessage-deflate is active
+                       and RSV1=1 (client compressed this frame).
+                       client_no_context_takeover was negotiated so fresh z_stream per message. */
+                    if (ctx->deflate_enabled && ctx->frame->rsv1) {
+                        z_stream            zs;
+                        u_char             *compressed;
+                        u_char             *inflated;
+                        uLong               inflated_size;
+                        int                 zret;
+                        uLong               consumed;
+
+                        /* RFC 7692: add back the trailing 0x00 0x00 0xFF 0xFF that
+                           the sender stripped before transmitting */
+                        compressed = ngx_pcalloc(ctx->temp_pool, ctx->frame->payload_len + 4);
+                        if (compressed == NULL) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                "push stream module: ws inflate: alloc compressed buf failed");
+                            goto finalize;
+                        }
+                        ngx_memcpy(compressed, ctx->frame->payload, ctx->frame->payload_len);
+                        compressed[ctx->frame->payload_len + 0] = 0x00;
+                        compressed[ctx->frame->payload_len + 1] = 0x00;
+                        compressed[ctx->frame->payload_len + 2] = 0xFF;
+                        compressed[ctx->frame->payload_len + 3] = 0xFF;
+
+                        /* allocate output buffer - start at 4x, expand once if needed */
+                        inflated_size = ctx->frame->payload_len * 4 + 256;
+                        inflated = ngx_pcalloc(ctx->temp_pool, inflated_size);
+                        if (inflated == NULL) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                "push stream module: ws inflate: alloc inflate buf failed");
+                            goto finalize;
+                        }
+
+                        ngx_memzero(&zs, sizeof(z_stream));
+                        if (inflateInit2(&zs, -15) != Z_OK) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                "push stream module: ws inflate: inflateInit2 failed");
+                            goto next_frame;
+                        }
+
+                        zs.next_in  = compressed;
+                        zs.avail_in = (uInt)(ctx->frame->payload_len + 4);
+                        zs.next_out = inflated;
+                        zs.avail_out = (uInt)inflated_size;
+
+                        zret = inflate(&zs, Z_SYNC_FLUSH);
+                        inflateEnd(&zs);
+
+                        if (zret != Z_OK && zret != Z_STREAM_END && zret != Z_BUF_ERROR) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                "push stream module: ws inflate: inflate failed ret=%d", zret);
+                            goto next_frame;
+                        }
+
+                        consumed = inflated_size - zs.avail_out;
+
+                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                            "push stream module: ws inflate: ok compressed=%ui inflated=%ul",
+                            ctx->frame->payload_len, consumed);
+
+                        ctx->frame->payload     = inflated;
+                        ctx->frame->payload_len = consumed;
+                    }
+#endif
+
                     if (!ngx_http_push_stream_is_utf8(ctx->frame->payload, ctx->frame->payload_len)) {
                         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                             "push stream module: ws_reading: payload failed UTF-8 check len=%ui byte0=0x%02uxd - skipping frame",
