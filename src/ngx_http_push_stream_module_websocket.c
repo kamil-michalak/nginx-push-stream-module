@@ -361,6 +361,9 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
 
     for (;;) {
         if (c->error || c->timedout || c->close || c->destroyed || rev->closed || rev->eof) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "push stream module: websocket_reading finalizing: error=%d timedout=%d close=%d destroyed=%d rev_closed=%d rev_eof=%d",
+                c->error, c->timedout, c->close, c->destroyed, rev->closed, rev->eof);
             goto finalize;
         }
 
@@ -500,6 +503,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     }
 
                     if (!ngx_http_push_stream_is_utf8(ctx->frame->payload, ctx->frame->payload_len)) {
+                        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                            "push stream module: websocket_reading finalizing: payload failed UTF-8 check, len=%ui first_byte=0x%02xd",
+                            ctx->frame->payload_len,
+                            (ctx->frame->payload_len > 0) ? (unsigned int)ctx->frame->payload[0] : 0);
                         goto finalize;
                     }
 
@@ -536,6 +543,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                             size_t     body_len = ctx->frame->payload_len - 1;
                             ngx_str_t  channel_id;
                             ngx_str_t  event_id  = ngx_null_string;
+
+                            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                "push stream module: resubscribe cmd=%c payload_len=%ui",
+                                cmd, ctx->frame->payload_len);
 
                             if (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE) {
                                 /* split "channel_name:event_id" on first ':' */
@@ -593,21 +604,15 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                 }
 
                 next_frame:
-                /* always restore the websocket read handler after any frame processing.
-                   send_old_messages, send_ack, or any other output_filter call may
-                   overwrite write_event_handler with flush_pending_output when the
-                   send buffer is full. Restore here so the connection stays alive. */
-                r->write_event_handler = ngx_http_push_stream_websocket_reading;
                 if (ctx->frame->last_fragment) {
                     ctx->frame->last_fragment = 0;
                     ctx->frame->fragmented = 0;
                     ngx_str_set(&ctx->frame->consolidated, "");
 
                     if (ctx->temp_pool != NULL) {
-                        /* payload was allocated from temp_pool - must clear buf pointers
-                           BEFORE destroying the pool to avoid use-after-free: on the next
-                           websocket_reading call line 378 reuses ctx->frame->buf.start which
-                           would point into freed memory and corrupt frame state */
+                        /* clear buf pointers BEFORE destroying pool to avoid use-after-free:
+                           payload was allocated from temp_pool, and on the next call to
+                           websocket_reading line 378 reuses ctx->frame->buf.start */
                         ctx->frame->payload = NULL;
                         ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->header, NULL, 8);
                         ngx_destroy_pool(ctx->temp_pool);
@@ -617,6 +622,11 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                 ctx->frame->step = NGX_HTTP_PUSH_STREAM_WEBSOCKET_READ_START_STEP;
                 ctx->frame->payload = NULL;
                 ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->header, NULL, 8);
+
+                /* do NOT override write_event_handler here. If output_filter set it to
+                   flush_pending_output (buffered ACK/history), let it drain and restore
+                   itself to ngx_http_request_empty_handler. Overriding with websocket_reading
+                   would prevent the buffer from draining, eventually causing c->error=1. */
 
                 if (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_OPCODE) {
                     ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE, sizeof(NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE), 1);
