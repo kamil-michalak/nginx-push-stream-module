@@ -118,6 +118,8 @@ typedef struct {
     ngx_msec_t                      subscriber_connection_ttl;
     ngx_msec_t                      longpolling_connection_ttl;
     ngx_flag_t                      websocket_allow_publish;
+    ngx_flag_t                      websocket_allow_resubscribe;
+    ngx_uint_t                      websocket_max_channels_per_connection;
     ngx_flag_t                      channel_info_on_publish;
     ngx_flag_t                      allow_connections_to_events_channel;
     ngx_http_complex_value_t       *last_received_message_time;
@@ -417,6 +419,24 @@ static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_16_BYTE   = 126;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_64_BYTE   = 127;
 
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_REASON = ngx_string("\x03\xF0{\"http_status\": %d, \"explain\":\"%V\"}");
+
+/* Dynamic subscribe/unsubscribe protocol (push_stream_websocket_allow_resubscribe on):
+ *   +channel_name            subscribe, no history
+ *   +channel_name:event_id   subscribe + send history from event_id
+ *   -channel_name            unsubscribe
+ * Separator ':' splits channel_name from event_id on subscribe.
+ */
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE    '+'
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE  '-'
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SEPARATOR    ':'
+
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED   = ngx_string("{\"subscribed\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_UNSUBSCRIBED = ngx_string("{\"unsubscribed\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND    = ngx_string("{\"error\":\"channel not found\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_ALREADY_SUB  = ngx_string("{\"error\":\"already subscribed\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_SUB      = ngx_string("{\"error\":\"not subscribed\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_CHANNELS = ngx_string("{\"error\":\"max channels reached\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_PER_CONN = ngx_string("{\"error\":\"max channels per connection reached\",\"channel\":\"%V\"}");
 
 
 // other stuff

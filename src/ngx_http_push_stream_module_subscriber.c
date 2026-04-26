@@ -106,6 +106,19 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     polling = ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_POLLING) || ((push_mode != NULL) && (push_mode->len == NGX_HTTP_PUSH_STREAM_MODE_POLLING.len) && (ngx_strncasecmp(push_mode->data, NGX_HTTP_PUSH_STREAM_MODE_POLLING.data, NGX_HTTP_PUSH_STREAM_MODE_POLLING.len) == 0)));
     longpolling = ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_LONGPOLLING) || ((push_mode != NULL) && (push_mode->len == NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.len) && (ngx_strncasecmp(push_mode->data, NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.data, NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.len) == 0)));
 
+    // for WebSocket connections check URL channel count against max_channels_per_connection
+    if ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET)
+        && (cf->websocket_max_channels_per_connection != NGX_CONF_UNSET_UINT)) {
+        ngx_uint_t  url_channel_count = 0;
+        for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+            url_channel_count++;
+        }
+        if (url_channel_count > cf->websocket_max_channels_per_connection) {
+            return ngx_http_push_stream_send_only_header_response(r, NGX_HTTP_FORBIDDEN,
+                &NGX_HTTP_PUSH_STREAM_NUMBER_OF_CHANNELS_EXCEEDED_MESSAGE);
+        }
+    }
+
     if (polling || longpolling) {
         ngx_int_t result = ngx_http_push_stream_subscriber_polling_handler(r, requested_channels, if_modified_since, tag, last_event_id, longpolling, ctx->temp_pool);
         if (ctx->temp_pool != NULL) {
