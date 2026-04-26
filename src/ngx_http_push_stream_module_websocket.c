@@ -117,6 +117,9 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     /* deliver history before registering to avoid double-delivery */
     if (last_event_id != NULL && last_event_id->len > 0) {
         ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
+        /* output_filter may overwrite write_event_handler with flush_pending_output
+           when the send buffer fills up - restore it so WebSocket reading keeps working */
+        r->write_event_handler = ngx_http_push_stream_websocket_reading;
     }
 
     if (ngx_http_push_stream_assing_subscription_to_channel(
@@ -189,6 +192,8 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     ngx_str_t                                      *explain_error_message;
     ngx_str_t                                      *upgrade_header, *connection_header, *sec_key_header, *sec_version_header, *sec_accept_header;
     ngx_int_t                                       version;
+    ngx_array_t                                    *event_id_parts;
+    ngx_uint_t                                      channel_index;
 
     // WebSocket connections must not use keepalive
     r->keepalive = 0;
@@ -277,9 +282,13 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     }
 
     // adding subscriber to channel(s) and send backtrack messages
+    // last_event_id may contain slash-separated per-channel event IDs (e.g. "evt_ch1/evt_ch2")
+    // matching the channel order in the subscription path
+    event_id_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
+    channel_index  = 0;
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, last_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool) != NGX_OK) {
             return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
         }
     }
