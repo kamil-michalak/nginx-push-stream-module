@@ -65,6 +65,11 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     ngx_http_push_stream_subscription_t *subscription;
     ngx_queue_t                         *q;
 
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "push stream module: handle_subscribe channel=\"%V\" event_id=\"%V\"",
+        channel_id,
+        (last_event_id != NULL) ? last_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY);
+
     /* check max channels per connection limit before touching shared memory */
     if (cf->websocket_max_channels_per_connection != NGX_CONF_UNSET_UINT) {
         ngx_uint_t  current = 0;
@@ -75,6 +80,9 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
             current++;
         }
         if (current >= cf->websocket_max_channels_per_connection) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "push stream module: handle_subscribe: max channels per connection reached current=%ui limit=%ui",
+                current, cf->websocket_max_channels_per_connection);
             ngx_http_push_stream_websocket_send_ack(r,
                 &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_PER_CONN, channel_id);
             return;
@@ -84,6 +92,8 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     /* find existing channel - do NOT create */
     channel = ngx_http_push_stream_find_channel(channel_id, r->connection->log, mcf);
     if (channel == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: channel not found \"%V\"", channel_id);
         ngx_http_push_stream_websocket_send_ack(r,
             &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND, channel_id);
         return;
@@ -95,6 +105,8 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
          q = ngx_queue_next(q)) {
         subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
         if (subscription->channel == channel) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "push stream module: handle_subscribe: already subscribed to \"%V\"", channel_id);
             ngx_http_push_stream_websocket_send_ack(r,
                 &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_ALREADY_SUB, channel_id);
             return;
@@ -104,6 +116,9 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
     /* check per-channel subscriber limit */
     if (mcf->max_subscribers_per_channel != NGX_CONF_UNSET_UINT
         && channel->subscribers >= mcf->max_subscribers_per_channel) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: channel \"%V\" subscriber limit reached subs=%ui limit=%ui",
+            channel_id, channel->subscribers, mcf->max_subscribers_per_channel);
         ngx_http_push_stream_websocket_send_ack(r,
             &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_CHANNELS, channel_id);
         return;
@@ -111,19 +126,33 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
 
     subscription = ngx_http_push_stream_create_channel_subscription(r, channel, ctx->subscriber);
     if (subscription == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: create_channel_subscription failed for \"%V\"", channel_id);
         return;
     }
 
     /* deliver history before registering to avoid double-delivery */
     if (last_event_id != NULL && last_event_id->len > 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: sending history from event_id=\"%V\" for \"%V\"",
+            last_event_id, channel_id);
         ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: history send done c->error=%d", r->connection->error);
     }
 
     if (ngx_http_push_stream_assing_subscription_to_channel(
             shpool, channel, subscription,
             &ctx->subscriber->subscriptions, r->connection->log) == NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: subscribed ok to \"%V\"", channel_id);
         ngx_http_push_stream_websocket_send_ack(r,
             &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED, channel_id);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: ack sent c->error=%d", r->connection->error);
+    } else {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "push stream module: handle_subscribe: assing_subscription failed for \"%V\"", channel_id);
     }
 }
 
@@ -305,7 +334,7 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     event_id_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
     channel_index  = 0;
 
-    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         "push stream module: WS connect last_event_id=\"%V\" parts=%ui",
         (last_event_id != NULL) ? last_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY,
         (event_id_parts != NULL) ? event_id_parts->nelts : 0);
@@ -314,7 +343,7 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
         ngx_str_t *ch_event_id;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
         ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
             "push stream module: WS connect channel[%ui]=\"%V\" event_id=\"%V\"",
             channel_index,
             requested_channel->id,
@@ -382,9 +411,9 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
 
     for (;;) {
         if (c->error || c->timedout || c->close || c->destroyed || rev->closed || rev->eof) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                "push stream module: websocket_reading finalizing: error=%d timedout=%d close=%d destroyed=%d rev_closed=%d rev_eof=%d",
-                c->error, c->timedout, c->close, c->destroyed, rev->closed, rev->eof);
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "push stream module: ws_reading closing: c->error=%d timedout=%d close=%d destroyed=%d rev_eof=%d rev_closed=%d",
+                c->error, c->timedout, c->close, c->destroyed, rev->eof, rev->closed);
             goto finalize;
         }
 
@@ -524,8 +553,8 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     }
 
                     if (!ngx_http_push_stream_is_utf8(ctx->frame->payload, ctx->frame->payload_len)) {
-                        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                            "push stream module: websocket_reading finalizing: payload failed UTF-8 check, len=%ui first_byte=0x%02xd",
+                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                            "push stream module: ws_reading finalizing: payload failed UTF-8 check len=%ui byte0=0x%02uxd",
                             ctx->frame->payload_len,
                             (ctx->frame->payload_len > 0) ? (unsigned int)ctx->frame->payload[0] : 0);
                         goto finalize;
@@ -565,7 +594,7 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                             ngx_str_t  channel_id;
                             ngx_str_t  event_id  = ngx_null_string;
 
-                            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                                 "push stream module: resubscribe cmd=%c payload_len=%ui",
                                 cmd, ctx->frame->payload_len);
 
@@ -654,6 +683,8 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                 }
 
                 if (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_OPCODE) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "push stream module: ws_reading: received CLOSE frame from client");
                     goto close;
                 }
                 return;
