@@ -31,6 +31,14 @@
 #include <ngx_http.h>
 #include <nginx.h>
 
+#if (NGX_HAVE_ZLIB)
+#include <zlib.h>
+#endif
+
+/* minimum payload size (bytes) worth compressing - frames smaller than this
+   are sent as-is even to deflate-enabled clients */
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN 200
+
 typedef struct {
     ngx_queue_t                     queue;
     ngx_regex_t                    *agent;
@@ -118,6 +126,8 @@ typedef struct {
     ngx_msec_t                      subscriber_connection_ttl;
     ngx_msec_t                      longpolling_connection_ttl;
     ngx_flag_t                      websocket_allow_publish;
+    ngx_flag_t                      websocket_allow_resubscribe;
+    ngx_uint_t                      websocket_max_channels_per_connection;
     ngx_flag_t                      channel_info_on_publish;
     ngx_flag_t                      allow_connections_to_events_channel;
     ngx_http_complex_value_t       *last_received_message_time;
@@ -147,6 +157,7 @@ struct ngx_http_push_stream_msg_s {
     ngx_str_t                      *event_id_message;
     ngx_str_t                      *event_type_message;
     ngx_str_t                      *formatted_messages;
+    ngx_str_t                      *compressed_messages;  /* deflated WS frames, NULL per slot if not worth compressing */
     ngx_int_t                       workers_ref_count;
     ngx_uint_t                      qtd_templates;
 };
@@ -243,6 +254,7 @@ typedef struct {
     ngx_str_t                          *callback;
     ngx_http_push_stream_requested_channel_t *requested_channels;
     ngx_http_push_stream_frame_t       *frame;
+    ngx_flag_t                          deflate_enabled;  /* permessage-deflate negotiated */
 } ngx_http_push_stream_module_ctx_t;
 
 // messages to worker processes
@@ -410,13 +422,36 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_MODE_WEBSOCKET   = ngx_string("webs
 #define NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_OPCODE  0xA
 
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE    =  NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4);
+/* same as TEXT_LAST_FRAME_BYTE but with RSV1=1 for permessage-deflate (FIN=1, RSV1=1, opcode=TEXT -> 0xC1) */
+static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_DEFLATE_BYTE = 0xC1;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_LAST_FRAME_BYTE[] = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_OPCODE | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE[]  = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE[]  = {NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_OPCODE  | (NGX_HTTP_PUSH_STREAM_WEBSOCKET_LAST_FRAME << 4), 0x00};
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_16_BYTE   = 126;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_64_BYTE   = 127;
 
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS  = ngx_string("Sec-WebSocket-Extensions");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE     = ngx_string("permessage-deflate; server_no_context_takeover");
+
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_REASON = ngx_string("\x03\xF0{\"http_status\": %d, \"explain\":\"%V\"}");
+
+/* Dynamic subscribe/unsubscribe protocol (push_stream_websocket_allow_resubscribe on):
+ *   +channel_name            subscribe, no history
+ *   +channel_name:event_id   subscribe + send history from event_id
+ *   -channel_name            unsubscribe
+ * Separator ':' splits channel_name from event_id on subscribe.
+ */
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE    '+'
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE  '-'
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SEPARATOR    ':'
+
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED   = ngx_string("{\"subscribed\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_UNSUBSCRIBED = ngx_string("{\"unsubscribed\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_FOUND    = ngx_string("{\"error\":\"channel not found\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_ALREADY_SUB  = ngx_string("{\"error\":\"already subscribed\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_NOT_SUB      = ngx_string("{\"error\":\"not subscribed\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_CHANNELS = ngx_string("{\"error\":\"max channels reached\",\"channel\":\"%V\"}");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_ERR_MAX_PER_CONN = ngx_string("{\"error\":\"max channels per connection reached\",\"channel\":\"%V\"}");
 
 
 // other stuff

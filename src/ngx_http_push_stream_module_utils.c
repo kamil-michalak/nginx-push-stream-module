@@ -272,6 +272,80 @@ ngx_http_push_stream_apply_text_template(ngx_str_t **dst_value, ngx_str_t **dst_
     return NGX_OK;
 }
 
+#if (NGX_HAVE_ZLIB)
+/*
+ * Compress plain WebSocket payload with raw deflate (RFC 7692 permessage-deflate).
+ * Uses server_no_context_takeover: z_stream is init/reset per message so the
+ * resulting bytes are identical every call - safe to cache in shared memory and
+ * send to many subscribers without per-connection state.
+ *
+ * Returns a fully framed ngx_str_t (opcode 0xC1 + length + deflated payload)
+ * allocated from temp_pool, or NULL when:
+ *   - payload is shorter than NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN
+ *   - deflated output is not smaller than the original
+ *   - any allocation / zlib error occurs
+ */
+static ngx_str_t *
+ngx_http_push_stream_deflate_websocket_frame(const u_char *payload, off_t payload_len,
+    ngx_pool_t *temp_pool)
+{
+    uLong     bound;
+    u_char   *deflated;
+    z_stream  zs;
+    int       ret;
+    uLong     compressed_len;
+
+    if (payload_len < NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN) {
+        return NULL;
+    }
+
+    bound = compressBound(payload_len);
+    if ((deflated = ngx_palloc(temp_pool, bound)) == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(&zs, sizeof(z_stream));
+    /* windowBits = -15: raw deflate, no zlib header or trailer */
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        return NULL;
+    }
+
+    zs.next_in  = (Bytef *) payload;
+    zs.avail_in = (uInt) payload_len;
+    zs.next_out = deflated;
+    zs.avail_out = (uInt) bound;
+
+    ret = deflate(&zs, Z_SYNC_FLUSH);
+    deflateEnd(&zs);
+
+    if (ret != Z_OK && ret != Z_BUF_ERROR) {
+        return NULL;
+    }
+
+    compressed_len = bound - zs.avail_out;
+
+    /* RFC 7692 s.7.2.1: remove trailing 00 00 FF FF added by Z_SYNC_FLUSH */
+    if (compressed_len >= 4
+        && deflated[compressed_len - 4] == 0x00
+        && deflated[compressed_len - 3] == 0x00
+        && deflated[compressed_len - 2] == (u_char) 0xFF
+        && deflated[compressed_len - 1] == (u_char) 0xFF)
+    {
+        compressed_len -= 4;
+    }
+
+    /* only use compressed version if it actually saves bytes */
+    if (compressed_len >= (uLong) payload_len) {
+        return NULL;
+    }
+
+    return ngx_http_push_stream_get_formatted_websocket_frame(
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_DEFLATE_BYTE, 1,
+        deflated, (off_t) compressed_len, temp_pool);
+}
+#endif /* NGX_HAVE_ZLIB */
+
 ngx_http_push_stream_msg_t *
 ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool)
 {
@@ -289,6 +363,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->event_id_message = NULL;
     msg->event_type_message = NULL;
     msg->formatted_messages = NULL;
+    msg->compressed_messages = NULL;
     msg->deleted = 0;
     msg->expires = 0;
     msg->id = id;
@@ -324,6 +399,14 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
         return NULL;
     }
     ngx_memzero(msg->formatted_messages, sizeof(ngx_str_t) * msg->qtd_templates);
+
+#if (NGX_HAVE_ZLIB)
+    if ((msg->compressed_messages = ngx_slab_alloc(shpool, sizeof(ngx_str_t) * msg->qtd_templates)) == NULL) {
+        ngx_http_push_stream_free_message_memory(shpool, msg);
+        return NULL;
+    }
+    ngx_memzero(msg->compressed_messages, sizeof(ngx_str_t) * msg->qtd_templates);
+#endif
 
     for (q = ngx_queue_head(&mcf->msg_templates); q != ngx_queue_sentinel(&mcf->msg_templates); q = ngx_queue_next(q)) {
         ngx_http_push_stream_template_t *cur = ngx_queue_data(q, ngx_http_push_stream_template_t, queue);
@@ -370,6 +453,23 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
 
         formmated->len = text->len;
         ngx_memcpy(formmated->data, text->data, formmated->len);
+
+#if (NGX_HAVE_ZLIB)
+        /* for websocket templates, also try to build a compressed frame */
+        if (cur->websocket) {
+            ngx_str_t *compressed = ngx_http_push_stream_deflate_websocket_frame(
+                aux->data, aux->len, temp_pool);
+            if (compressed != NULL) {
+                ngx_str_t *comp_slot = (msg->compressed_messages + i);
+                if ((comp_slot->data = ngx_slab_alloc(shpool, compressed->len)) != NULL) {
+                    comp_slot->len = compressed->len;
+                    ngx_memcpy(comp_slot->data, compressed->data, comp_slot->len);
+                }
+                /* if slab_alloc failed for compressed we just leave slot zeroed -
+                   get_formatted_message will fall back to the plain frame */
+            }
+        }
+#endif
 
         i++;
     }
@@ -457,6 +557,11 @@ ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t
     ngx_pool_t                             *temp_pool = received_temp_pool;
 
     if ((mcf->events_channel_id.len > 0) && !channel->for_events) {
+        /* skip entirely if nobody is subscribed to the events channel */
+        if (data->events_channel == NULL || data->events_channel->subscribers == 0) {
+            return NGX_OK;
+        }
+
         if ((temp_pool == NULL) && ((temp_pool = ngx_create_pool(4096, log)) == NULL)) {
             return NGX_ERROR;
         }
@@ -550,9 +655,11 @@ ngx_http_push_stream_get_header(ngx_http_request_t *r, const ngx_str_t *header_n
         }
 
         if ((h[i].key.len == header_name->len) && (ngx_strncasecmp(h[i].key.data, header_name->data, header_name->len) == 0)) {
-            aux = ngx_http_push_stream_create_str(r->pool, h[i].value.len);
+            /* return a pointer into nginx's already-parsed header - no copy needed */
+            aux = ngx_pcalloc(r->pool, sizeof(ngx_str_t));
             if (aux != NULL) {
-                ngx_memcpy(aux->data, h[i].value.data, h[i].value.len);
+                aux->data = h[i].value.data;
+                aux->len  = h[i].value.len;
             }
             break;
         }
@@ -1217,6 +1324,18 @@ ngx_http_push_stream_free_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_
         ngx_slab_free_locked(shpool, msg->formatted_messages);
     }
 
+#if (NGX_HAVE_ZLIB)
+    if (msg->compressed_messages != NULL) {
+        for (i = 0; i < msg->qtd_templates; i++) {
+            ngx_str_t *comp = (msg->compressed_messages + i);
+            if ((comp != NULL) && (comp->data != NULL)) {
+                ngx_slab_free_locked(shpool, comp->data);
+            }
+        }
+        ngx_slab_free_locked(shpool, msg->compressed_messages);
+    }
+#endif
+
     if (msg->raw.data != NULL) ngx_slab_free_locked(shpool, msg->raw.data);
     if (msg->event_id != NULL) ngx_slab_free_locked(shpool, msg->event_id);
     if (msg->event_type != NULL) ngx_slab_free_locked(shpool, msg->event_type);
@@ -1378,7 +1497,19 @@ static ngx_str_t *
 ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *message)
 {
     ngx_http_push_stream_loc_conf_t        *pslcf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_module_ctx_t      *ctx   = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+
     if (pslcf->message_template_index > 0) {
+#if (NGX_HAVE_ZLIB)
+        if (ctx != NULL && ctx->deflate_enabled && message->compressed_messages != NULL) {
+            ngx_str_t *comp = message->compressed_messages + pslcf->message_template_index - 1;
+            if (comp->data != NULL && comp->len > 0) {
+                return comp;
+            }
+            /* compressed slot empty (payload too small or compression unhelpful)
+               - fall through to plain frame */
+        }
+#endif
         return message->formatted_messages + pslcf->message_template_index - 1;
     }
     return &message->raw;

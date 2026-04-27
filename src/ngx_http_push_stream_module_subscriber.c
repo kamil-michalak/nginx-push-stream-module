@@ -25,6 +25,8 @@
 
 #include <ngx_http_push_stream_module_subscriber.h>
 
+static ngx_array_t                              *ngx_http_push_stream_split_last_event_ids(ngx_pool_t *pool, ngx_str_t *last_event_id);
+static ngx_str_t                                *ngx_http_push_stream_get_event_id_by_index(ngx_array_t *parts, ngx_uint_t index);
 static ngx_int_t                                 ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_http_push_stream_loc_conf_t *cf, ngx_http_request_t *r, ngx_http_push_stream_requested_channel_t *requested_channel, time_t if_modified_since, ngx_int_t tag, ngx_str_t *last_event_id, ngx_http_push_stream_subscriber_t *subscriber, ngx_pool_t *temp_pool);
 static ngx_http_push_stream_subscriber_t        *ngx_http_push_stream_subscriber_prepare_request_to_keep_connected(ngx_http_request_t *r);
 static ngx_int_t                                 ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_stream_subscriber_t *worker_subscriber);
@@ -54,6 +56,8 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     ngx_int_t                                       status_code;
     ngx_str_t                                      *explain_error_message;
     ngx_str_t                                       vv_allowed_origins = ngx_null_string;
+    ngx_array_t                                    *event_id_parts;
+    ngx_uint_t                                      channel_index;
 
     // add headers to support cross domain requests
     if (cf->allowed_origins != NULL) {
@@ -102,6 +106,19 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     polling = ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_POLLING) || ((push_mode != NULL) && (push_mode->len == NGX_HTTP_PUSH_STREAM_MODE_POLLING.len) && (ngx_strncasecmp(push_mode->data, NGX_HTTP_PUSH_STREAM_MODE_POLLING.data, NGX_HTTP_PUSH_STREAM_MODE_POLLING.len) == 0)));
     longpolling = ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_LONGPOLLING) || ((push_mode != NULL) && (push_mode->len == NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.len) && (ngx_strncasecmp(push_mode->data, NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.data, NGX_HTTP_PUSH_STREAM_MODE_LONGPOLLING.len) == 0)));
 
+    // for WebSocket connections check URL channel count against max_channels_per_connection
+    if ((cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET)
+        && (cf->websocket_max_channels_per_connection != NGX_CONF_UNSET_UINT)) {
+        ngx_uint_t  url_channel_count = 0;
+        for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+            url_channel_count++;
+        }
+        if (url_channel_count > cf->websocket_max_channels_per_connection) {
+            return ngx_http_push_stream_send_only_header_response(r, NGX_HTTP_FORBIDDEN,
+                &NGX_HTTP_PUSH_STREAM_NUMBER_OF_CHANNELS_EXCEEDED_MESSAGE);
+        }
+    }
+
     if (polling || longpolling) {
         ngx_int_t result = ngx_http_push_stream_subscriber_polling_handler(r, requested_channels, if_modified_since, tag, last_event_id, longpolling, ctx->temp_pool);
         if (ctx->temp_pool != NULL) {
@@ -131,10 +148,14 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     }
 
     // adding subscriber to channel(s) and send old messages
+    // last_event_id may contain slash-separated per-channel event IDs (e.g. "evt_ch1/evt_ch2")
+    // matching the channel order in the subscription path
+    event_id_parts = ngx_http_push_stream_split_last_event_ids(r->pool, last_event_id);
+    channel_index  = 0;
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, last_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
@@ -175,11 +196,17 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     greater_message_tag = tag;
     greater_message_time = (if_modified_since < 0) ? 0 : if_modified_since;
 
+    // Parse slash-separated per-channel last_event_id values once, reuse in both loops.
+    // Format: "evt_ch1/evt_ch2/..." matching channel order in the subscription path.
+    // Channels with no corresponding entry (or empty entry) fall back to if_modified_since/tag.
+    ngx_array_t *event_id_parts = ngx_http_push_stream_split_last_event_ids(temp_pool, last_event_id);
+    ngx_uint_t   channel_index  = 0;
+
     // check if has any message to send
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_has_old_messages_to_send(requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id)) {
+        if (ngx_http_push_stream_has_old_messages_to_send(requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++))) {
             has_message_to_send = 1;
             if (requested_channel->channel->last_message_time > greater_message_time) {
                 greater_message_time = requested_channel->channel->last_message_time;
@@ -244,9 +271,11 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
         ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_CALLBACK_INIT_CHUNK.data, NGX_HTTP_PUSH_STREAM_CALLBACK_INIT_CHUNK.len, 0);
     }
 
+    // Reset index for second pass (send loop) over the same channel list
+    channel_index = 0;
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
-        ngx_http_push_stream_send_old_messages(r, requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id);
+        ngx_http_push_stream_send_old_messages(r, requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++));
     }
 
     if (ctx->callback != NULL) {
@@ -666,4 +695,75 @@ ngx_http_push_stream_get_padding_by_user_agent(ngx_http_request_t *r)
     }
 
     return NULL;
+}
+
+/*
+ * ngx_http_push_stream_split_last_event_ids
+ *
+ * Splits a slash-separated last_event_id string into an ngx_array_t of ngx_str_t.
+ * Example: "evt_ch1/evt_ch2/evt_ch3" -> ["evt_ch1", "evt_ch2", "evt_ch3"]
+ *
+ * Empty segments (e.g. "evt1//evt3") produce a zero-length ngx_str_t at that index,
+ * which ngx_http_push_stream_get_event_id_by_index() maps to NULL (= no filter).
+ *
+ * Returns an empty array (not NULL) when last_event_id is NULL or empty.
+ */
+static ngx_array_t *
+ngx_http_push_stream_split_last_event_ids(ngx_pool_t *pool, ngx_str_t *last_event_id)
+{
+    ngx_array_t  *parts;
+    ngx_str_t    *part;
+    u_char       *start, *end, *p;
+
+    parts = ngx_array_create(pool, 4, sizeof(ngx_str_t));
+    if (parts == NULL) {
+        return NULL;
+    }
+
+    if (last_event_id == NULL || last_event_id->len == 0) {
+        return parts; /* empty array - callers fall back to if_modified_since/tag */
+    }
+
+    start = last_event_id->data;
+    end   = last_event_id->data + last_event_id->len;
+
+    for (p = start; p <= end; p++) {
+        if (p == end || *p == '/') {
+            part = ngx_array_push(parts);
+            if (part == NULL) {
+                return NULL;
+            }
+            part->data = start;
+            part->len  = (ngx_uint_t)(p - start);
+            start = p + 1;
+        }
+    }
+
+    return parts;
+}
+
+/*
+ * ngx_http_push_stream_get_event_id_by_index
+ *
+ * Returns the ngx_str_t at position `index` in the parts array, or NULL when:
+ *   - parts is NULL
+ *   - index is out of range (fewer parts than channels - safe fallback)
+ *   - the segment is empty ("" means "no filter for this channel")
+ */
+static ngx_str_t *
+ngx_http_push_stream_get_event_id_by_index(ngx_array_t *parts, ngx_uint_t index)
+{
+    ngx_str_t *elts;
+
+    if (parts == NULL || parts->nelts <= index) {
+        return NULL;
+    }
+
+    elts = (ngx_str_t *) parts->elts;
+
+    if (elts[index].len == 0) {
+        return NULL; /* empty segment - treat as "no filter" */
+    }
+
+    return &elts[index];
 }
