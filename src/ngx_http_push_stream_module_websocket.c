@@ -591,7 +591,7 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         if (inflateInit2(&zs, -15) != Z_OK) {
                             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                                 "push stream module: ws inflate: inflateInit2 failed");
-                            goto next_frame;
+                            goto finalize;
                         }
 
                         zs.next_in  = compressed;
@@ -605,14 +605,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         if (zret != Z_OK && zret != Z_STREAM_END && zret != Z_BUF_ERROR) {
                             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                                 "push stream module: ws inflate: inflate failed ret=%d", zret);
-                            goto next_frame;
+                            goto finalize;
                         }
 
                         consumed = inflated_size - zs.avail_out;
-
-                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                            "push stream module: ws inflate: ok compressed=%ui inflated=%ul",
-                            ctx->frame->payload_len, consumed);
 
                         ctx->frame->payload     = inflated;
                         ctx->frame->payload_len = consumed;
