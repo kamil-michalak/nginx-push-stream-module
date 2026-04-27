@@ -189,6 +189,8 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     ngx_str_t                                      *explain_error_message;
     ngx_str_t                                      *upgrade_header, *connection_header, *sec_key_header, *sec_version_header, *sec_accept_header;
     ngx_int_t                                       version;
+    ngx_array_t                                    *event_id_parts;
+    ngx_uint_t                                      channel_index;
 
     // WebSocket connections must not use keepalive
     r->keepalive = 0;
@@ -298,9 +300,17 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     }
 
     // adding subscriber to channel(s) and send backtrack messages
+    // last_event_id may contain slash-separated per-channel event IDs (e.g. "evt_ch1/evt_ch2")
+    // matching the channel order in the subscription path
+    event_id_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
+    channel_index  = 0;
+
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+        ngx_str_t *ch_event_id;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, last_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
+        channel_index++;
+        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ch_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
             return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
         }
     }
@@ -564,6 +574,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
 #endif
 
                     if (!ngx_http_push_stream_is_utf8(ctx->frame->payload, ctx->frame->payload_len)) {
+                        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                            "push stream module: websocket_reading finalizing: payload failed UTF-8 check, len=%ui first_byte=0x%02xd",
+                            ctx->frame->payload_len,
+                            (ctx->frame->payload_len > 0) ? (unsigned int)ctx->frame->payload[0] : 0);
                         goto finalize;
                     }
 
@@ -663,6 +677,11 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     ngx_str_set(&ctx->frame->consolidated, "");
 
                     if (ctx->temp_pool != NULL) {
+                        /* clear buf pointers BEFORE destroying pool to avoid use-after-free:
+                           payload was allocated from temp_pool, and on the next call to
+                           websocket_reading line 378 reuses ctx->frame->buf.start */
+                        ctx->frame->payload = NULL;
+                        ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->header, NULL, 8);
                         ngx_destroy_pool(ctx->temp_pool);
                         ctx->temp_pool = NULL;
                     }
@@ -670,6 +689,11 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                 ctx->frame->step = NGX_HTTP_PUSH_STREAM_WEBSOCKET_READ_START_STEP;
                 ctx->frame->payload = NULL;
                 ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->header, NULL, 8);
+
+                /* do NOT override write_event_handler here. If output_filter set it to
+                   flush_pending_output (buffered ACK/history), let it drain and restore
+                   itself to ngx_http_request_empty_handler. Overriding with websocket_reading
+                   would prevent the buffer from draining, eventually causing c->error=1. */
 
                 if (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_OPCODE) {
                     ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE, sizeof(NGX_HTTP_PUSH_STREAM_WEBSOCKET_PONG_LAST_FRAME_BYTE), 1);
