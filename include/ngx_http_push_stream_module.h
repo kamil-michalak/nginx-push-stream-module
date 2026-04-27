@@ -431,7 +431,7 @@ static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_16_BYTE   = 126;
 static const u_char NGX_HTTP_PUSH_STREAM_WEBSOCKET_PAYLOAD_LEN_64_BYTE   = 127;
 
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS  = ngx_string("Sec-WebSocket-Extensions");
-static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE     = ngx_string("permessage-deflate; server_no_context_takeover");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE     = ngx_string("permessage-deflate; server_no_context_takeover; client_no_context_takeover");
 
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_WEBSOCKET_CLOSE_REASON = ngx_string("\x03\xF0{\"http_status\": %d, \"explain\":\"%V\"}");
 
