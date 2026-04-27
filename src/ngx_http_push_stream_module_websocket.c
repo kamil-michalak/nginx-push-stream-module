@@ -284,20 +284,10 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     event_id_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
     channel_index  = 0;
 
-    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-        "push stream module: WS connect last_event_id=\"%V\" parts=%ui",
-        (last_event_id != NULL) ? last_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY,
-        (event_id_parts != NULL) ? event_id_parts->nelts : 0);
-
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         ngx_str_t *ch_event_id;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
         ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-            "push stream module: WS connect channel[%ui]=\"%V\" event_id=\"%V\"",
-            channel_index,
-            requested_channel->id,
-            (ch_event_id != NULL) ? ch_event_id : &NGX_HTTP_PUSH_STREAM_EMPTY);
         channel_index++;
         if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ch_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
             return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
@@ -361,9 +351,6 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
 
     for (;;) {
         if (c->error || c->timedout || c->close || c->destroyed || rev->closed || rev->eof) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                "push stream module: websocket_reading finalizing: error=%d timedout=%d close=%d destroyed=%d rev_closed=%d rev_eof=%d",
-                c->error, c->timedout, c->close, c->destroyed, rev->closed, rev->eof);
             goto finalize;
         }
 
@@ -543,10 +530,6 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                             size_t     body_len = ctx->frame->payload_len - 1;
                             ngx_str_t  channel_id;
                             ngx_str_t  event_id  = ngx_null_string;
-
-                            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                                "push stream module: resubscribe cmd=%c payload_len=%ui",
-                                cmd, ctx->frame->payload_len);
 
                             if (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE) {
                                 /* split "channel_name:event_id" on first ':' */
