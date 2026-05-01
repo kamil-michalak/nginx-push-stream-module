@@ -1060,9 +1060,25 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     mcf->shm_zone = shm_zone;
     mcf->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
 
-    if (data) { /* zone already initialized */
+    if (data) { /* zone already initialized - reload path */
         shm_zone->data = data;
         d = (ngx_http_push_stream_shm_data_t *) data;
+
+        /* transfer pre-allocated shared messages from the old mcf to the new one
+           so they are reused instead of re-created (and the old ones leaked) */
+        if (d->mcf != NULL) {
+            if (mcf->ping_msg == NULL && d->mcf->ping_msg != NULL) {
+                mcf->ping_msg = d->mcf->ping_msg;
+            } else if (d->mcf->ping_msg != NULL && d->mcf->ping_msg != mcf->ping_msg) {
+                ngx_http_push_stream_free_message_memory(mcf->shpool, d->mcf->ping_msg);
+            }
+            if (mcf->longpooling_timeout_msg == NULL && d->mcf->longpooling_timeout_msg != NULL) {
+                mcf->longpooling_timeout_msg = d->mcf->longpooling_timeout_msg;
+            } else if (d->mcf->longpooling_timeout_msg != NULL && d->mcf->longpooling_timeout_msg != mcf->longpooling_timeout_msg) {
+                ngx_http_push_stream_free_message_memory(mcf->shpool, d->mcf->longpooling_timeout_msg);
+            }
+        }
+
         d->mcf = mcf;
         d->shm_zone = shm_zone;
         d->shpool = mcf->shpool;

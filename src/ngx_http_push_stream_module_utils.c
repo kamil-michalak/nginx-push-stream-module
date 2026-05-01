@@ -1500,6 +1500,11 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
     ngx_http_push_stream_module_ctx_t      *ctx   = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
 
     if (pslcf->message_template_index > 0) {
+        /* after reload the template count may differ from when the message was created;
+           fall back to raw to avoid out-of-bounds access on formatted_messages */
+        if ((ngx_uint_t) pslcf->message_template_index > message->qtd_templates) {
+            return &message->raw;
+        }
 #if (NGX_HAVE_ZLIB)
         if (ctx != NULL && ctx->deflate_enabled && message->compressed_messages != NULL) {
             ngx_str_t *comp = message->compressed_messages + pslcf->message_template_index - 1;
