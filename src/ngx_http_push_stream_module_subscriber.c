@@ -30,7 +30,7 @@ static ngx_str_t                                *ngx_http_push_stream_get_event_
 static ngx_int_t                                 ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_http_push_stream_loc_conf_t *cf, ngx_http_request_t *r, ngx_http_push_stream_requested_channel_t *requested_channel, time_t if_modified_since, ngx_int_t tag, ngx_str_t *last_event_id, ngx_http_push_stream_subscriber_t *subscriber, ngx_pool_t *temp_pool);
 static ngx_http_push_stream_subscriber_t        *ngx_http_push_stream_subscriber_prepare_request_to_keep_connected(ngx_http_request_t *r);
 static ngx_int_t                                 ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_stream_subscriber_t *worker_subscriber);
-static ngx_flag_t                                ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id);
+static ngx_uint_t                                ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id);
 static void                                      ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id);
 static ngx_http_push_stream_pid_queue_t         *ngx_http_push_stream_get_worker_subscriber_channel_sentinel_locked(ngx_slab_pool_t *shpool, ngx_http_push_stream_channel_t *channel, ngx_log_t *log);
 static ngx_http_push_stream_subscription_t      *ngx_http_push_stream_create_channel_subscription(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_subscriber_t *subscriber);
@@ -206,7 +206,7 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_has_old_messages_to_send(requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++))) {
+        if (ngx_http_push_stream_has_old_messages_to_send(requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index)) == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
             has_message_to_send = 1;
             if (requested_channel->channel->last_message_time > greater_message_time) {
                 greater_message_time = requested_channel->channel->last_message_time;
@@ -296,13 +296,55 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
 {
     ngx_http_push_stream_subscription_t        *subscription;
     ngx_slab_pool_t                            *shpool = mcf->shpool;
+    ngx_uint_t                                  old_msg_status;
 
     if ((subscription = ngx_http_push_stream_create_channel_subscription(r, requested_channel->channel, subscriber)) == NULL) {
         return NGX_ERROR;
     }
 
-    // send old messages to new subscriber
-    ngx_http_push_stream_send_old_messages(r, requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, 0, -1, last_event_id);
+    /* check if event_id was given but not found in the buffer */
+    old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
+        requested_channel->channel, requested_channel->backtrack_messages,
+        if_modified_since, tag, 0, -1, last_event_id);
+
+    if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
+        && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
+
+        /* build JSON: {"error":"unknown_event_id","channel":"...","event":"..."} */
+        ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
+            NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
+            + requested_channel->id->len
+            + last_event_id->len);
+
+        if (json != NULL) {
+            json->len = ngx_sprintf(json->data,
+                (char *) NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.data,
+                requested_channel->id, last_event_id) - json->data;
+
+            if (cf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET) {
+                ngx_str_t *frame = ngx_http_push_stream_get_formatted_websocket_frame(
+                    &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE, 1,
+                    json->data, json->len, r->pool);
+                if (frame != NULL) {
+                    ngx_http_push_stream_send_response_text(r, frame->data, frame->len, 0);
+                }
+            } else {
+                ngx_http_push_stream_send_response_text(r, json->data, json->len, 0);
+            }
+
+            if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
+                ngx_http_push_stream_send_response_finalize(r);
+                return NGX_ERROR;
+            }
+        }
+        /* NOTIFY mode: fall through - subscriber is still registered */
+    }
+
+    /* send old messages only when found */
+    if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
+        ngx_http_push_stream_send_old_messages(r, requested_channel->channel,
+            requested_channel->backtrack_messages, if_modified_since, tag, 0, -1, last_event_id);
+    }
 
     return ngx_http_push_stream_assing_subscription_to_channel(shpool, requested_channel->channel, subscription, &subscriber->subscriptions, r->connection->log);
 }
@@ -498,19 +540,19 @@ ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_st
     return NGX_OK;
 }
 
-static ngx_flag_t
+static ngx_uint_t
 ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id)
 {
-    ngx_flag_t old_messages = 0;
     ngx_http_push_stream_msg_t *message;
     ngx_queue_t                *q;
 
     if (channel->stored_messages > 0) {
 
         if (backtrack > 0) {
-            old_messages = 1;
+            return NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND;
         } else if ((last_event_id != NULL) || (if_modified_since >= 0)) {
             ngx_flag_t found = 0;
+            ngx_flag_t has_after = 0;
             ngx_shmtx_lock(channel->mutex);
             for (q = ngx_queue_head(&channel->message_queue); q != ngx_queue_sentinel(&channel->message_queue); q = ngx_queue_next(q)) {
                 message = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
@@ -531,14 +573,20 @@ ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *ch
                 }
 
                 if (found) {
-                    old_messages = 1;
+                    has_after = 1;
                     break;
                 }
             }
             ngx_shmtx_unlock(channel->mutex);
+
+            if (found || (if_modified_since >= 0)) {
+                return has_after ? NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND : NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE;
+            }
+            /* last_event_id was provided but not found in buffer */
+            return NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND;
         }
     }
-    return old_messages;
+    return NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE;
 }
 
 static void
@@ -548,7 +596,7 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
     ngx_http_push_stream_msg_t            *message;
     ngx_queue_t                           *q;
 
-    if (ngx_http_push_stream_has_old_messages_to_send(channel, backtrack, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id)) {
+    if (ngx_http_push_stream_has_old_messages_to_send(channel, backtrack, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id) == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
         if (backtrack > 0) {
             ngx_uint_t qtd = (backtrack > channel->stored_messages) ? channel->stored_messages : backtrack;
             ngx_uint_t start = channel->stored_messages - qtd;

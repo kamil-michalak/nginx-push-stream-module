@@ -128,6 +128,7 @@ typedef struct {
     ngx_flag_t                      websocket_allow_publish;
     ngx_flag_t                      websocket_allow_resubscribe;
     ngx_uint_t                      websocket_max_channels_per_connection;
+    ngx_uint_t                      unknown_event_id_behavior;
     ngx_flag_t                      channel_info_on_publish;
     ngx_flag_t                      allow_connections_to_events_channel;
     ngx_http_complex_value_t       *last_received_message_time;
@@ -402,6 +403,19 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_MODE_WEBSOCKET   = ngx_string("webs
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_LONGPOLLING 2
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE 3
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET   4
+
+/* behavior when subscriber connects with event_id not found in channel buffer */
+#define NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE     0
+#define NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_NOTIFY     1
+#define NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT 2
+
+/* return values for has_old_messages_to_send */
+#define NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE       0
+#define NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND      1
+#define NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND  2
+
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON =
+    ngx_string("{\"error\":\"unknown_event_id\",\"channel\":\"%V\",\"event\":\"%V\"}");
 
 #define NGX_HTTP_PUSH_STREAM_PUBLISHER_MODE_NORMAL       5
 #define NGX_HTTP_PUSH_STREAM_PUBLISHER_MODE_ADMIN        6

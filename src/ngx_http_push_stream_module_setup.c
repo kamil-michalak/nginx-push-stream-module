@@ -28,6 +28,13 @@
 ngx_uint_t ngx_http_push_stream_padding_max_len = 0;
 ngx_flag_t ngx_http_push_stream_enabled = 0;
 
+static ngx_conf_enum_t  ngx_http_push_stream_unknown_event_id_behaviors[] = {
+    { ngx_string("ignore"),     NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE },
+    { ngx_string("notify"),     NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_NOTIFY },
+    { ngx_string("disconnect"), NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT },
+    { ngx_null_string, 0 }
+};
+
 static ngx_command_t    ngx_http_push_stream_commands[] = {
     { ngx_string("push_stream_channels_statistics"),
         NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
@@ -219,6 +226,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, websocket_max_channels_per_connection),
         NULL },
+    { ngx_string("push_stream_unknown_event_id_behavior"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_enum_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, unknown_event_id_behavior),
+        &ngx_http_push_stream_unknown_event_id_behaviors },
     { ngx_string("push_stream_last_received_message_time"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF|NGX_CONF_TAKE1,
         ngx_http_set_complex_value_slot,
@@ -593,6 +606,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->websocket_allow_publish = NGX_CONF_UNSET_UINT;
     lcf->websocket_allow_resubscribe = NGX_CONF_UNSET_UINT;
     lcf->websocket_max_channels_per_connection = NGX_CONF_UNSET_UINT;
+    lcf->unknown_event_id_behavior = NGX_CONF_UNSET_UINT;
     lcf->channel_info_on_publish = NGX_CONF_UNSET_UINT;
     lcf->allow_connections_to_events_channel = NGX_CONF_UNSET_UINT;
     lcf->last_received_message_time = NULL;
@@ -625,6 +639,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->websocket_allow_publish, prev->websocket_allow_publish, 0);
     ngx_conf_merge_value(conf->websocket_allow_resubscribe, prev->websocket_allow_resubscribe, 0);
     ngx_conf_merge_uint_value(conf->websocket_max_channels_per_connection, prev->websocket_max_channels_per_connection, NGX_CONF_UNSET_UINT);
+    ngx_conf_merge_uint_value(conf->unknown_event_id_behavior, prev->unknown_event_id_behavior, NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE);
     ngx_conf_merge_value(conf->channel_info_on_publish, prev->channel_info_on_publish, 1);
     ngx_conf_merge_value(conf->allow_connections_to_events_channel, prev->allow_connections_to_events_channel, 0);
     ngx_conf_merge_str_value(conf->padding_by_user_agent, prev->padding_by_user_agent, NGX_HTTP_PUSH_STREAM_DEFAULT_PADDING_BY_USER_AGENT);
