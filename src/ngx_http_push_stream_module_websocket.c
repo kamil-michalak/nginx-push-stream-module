@@ -114,16 +114,49 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
         return;
     }
 
-    /* deliver history before registering to avoid double-delivery */
-    if (last_event_id != NULL && last_event_id->len > 0) {
-        ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
-    }
-
     if (ngx_http_push_stream_assing_subscription_to_channel(
             shpool, channel, subscription,
-            &ctx->subscriber->subscriptions, r->connection->log) == NGX_OK) {
-        ngx_http_push_stream_websocket_send_ack(r,
-            &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED, channel_id);
+            &ctx->subscriber->subscriptions, r->connection->log) != NGX_OK) {
+        return;
+    }
+
+    /* send ACK first so client knows subscription succeeded before history arrives */
+    ngx_http_push_stream_websocket_send_ack(r,
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_ACK_SUBSCRIBED, channel_id);
+
+    /* handle history / unknown event_id */
+    if (last_event_id != NULL && last_event_id->len > 0) {
+        ngx_uint_t old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
+            channel, 0, -1, -1, 0, -1, last_event_id);
+
+        if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
+            ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, last_event_id);
+
+        } else if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
+                   && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
+
+            ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
+                NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
+                + channel_id->len
+                + last_event_id->len);
+
+            if (json != NULL) {
+                json->len = ngx_sprintf(json->data,
+                    (char *) NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.data,
+                    channel_id, last_event_id) - json->data;
+
+                ngx_str_t *frame = ngx_http_push_stream_get_formatted_websocket_frame(
+                    &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE, 1,
+                    json->data, json->len, r->pool);
+                if (frame != NULL) {
+                    ngx_http_push_stream_send_response_text(r, frame->data, frame->len, 0);
+                }
+
+                if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
+                    ngx_http_push_stream_send_response_finalize(r);
+                }
+            }
+        }
     }
 }
 
