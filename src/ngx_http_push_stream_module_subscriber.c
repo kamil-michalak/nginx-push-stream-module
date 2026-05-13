@@ -221,6 +221,8 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                 }
             }
         } else if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
+                   && ch_event_id != NULL
+                   && requested_channel->id != NULL
                    && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
 
             /* build JSON error */
@@ -340,6 +342,8 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
         if_modified_since, tag, 0, -1, last_event_id);
 
     if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
+        && last_event_id != NULL
+        && requested_channel->id != NULL
         && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
 
         /* build JSON: {"error":"unknown_event_id","channel":"...","event":"..."} */
