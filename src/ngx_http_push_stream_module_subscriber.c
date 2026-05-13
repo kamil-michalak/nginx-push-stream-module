@@ -153,9 +153,16 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     event_id_parts = ngx_http_push_stream_split_last_event_ids(r->pool, last_event_id);
     channel_index  = 0;
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+        ngx_int_t assign_rc;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        assign_rc = ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool);
+        if (assign_rc == NGX_DONE) {
+            /* disconnect behavior: JSON error was sent, connection should close.
+               Return NGX_DONE so nginx closes cleanly without accessing r again. */
+            return NGX_DONE;
+        }
+        if (assign_rc != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
@@ -375,8 +382,12 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
             }
 
             if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
-                ngx_http_push_stream_send_response_finalize(r);
-                return NGX_ERROR;
+                /* return NGX_DONE - do NOT call finalize here.
+                   The caller checks for NGX_DONE and returns NGX_DONE to nginx,
+                   which closes the connection cleanly without accessing r again.
+                   Calling finalize here and then having the caller also handle
+                   the error causes a double-finalize crash (segfault at 0). */
+                return NGX_DONE;
             }
         }
         /* NOTIFY mode: fall through - subscriber is still registered */

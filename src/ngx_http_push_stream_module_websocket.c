@@ -340,10 +340,24 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
 
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         ngx_str_t *ch_event_id;
+        ngx_int_t  assign_rc;
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
         ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
         channel_index++;
-        if (ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ch_event_id, worker_subscriber, ctx->temp_pool) != NGX_OK) {
+        assign_rc = ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ch_event_id, worker_subscriber, ctx->temp_pool);
+        if (assign_rc == NGX_DONE) {
+            /* disconnect behavior: JSON error was sent, close WebSocket cleanly */
+            if (ctx->temp_pool != NULL) {
+                ngx_destroy_pool(ctx->temp_pool);
+                ctx->temp_pool = NULL;
+            }
+            return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_OK, &NGX_HTTP_PUSH_STREAM_EMPTY);
+        }
+        if (assign_rc != NGX_OK) {
+            if (ctx->temp_pool != NULL) {
+                ngx_destroy_pool(ctx->temp_pool);
+                ctx->temp_pool = NULL;
+            }
             return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
         }
     }
