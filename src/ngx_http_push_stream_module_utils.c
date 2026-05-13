@@ -608,6 +608,20 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
                 rc = ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_CALLBACK_MID_CHUNK.data, NGX_HTTP_PUSH_STREAM_CALLBACK_MID_CHUNK.len, 0);
             }
 
+            /* send configured separator before every message except the first.
+               send_separator == ctx->message_sent == 1 for non-first messages.
+               Not applied for WebSocket (each message is its own frame),
+               EventSource (uses protocol \n\n separator), or JSONP (uses MID_CHUNK). */
+            if ((rc == NGX_OK)
+                && send_separator
+                && !use_jsonp
+                && (pslcf->message_separator.len > 0)
+                && (pslcf->location_type != NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE)
+                && (pslcf->location_type != NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET)) {
+                rc = ngx_http_push_stream_send_response_text(r,
+                    pslcf->message_separator.data, pslcf->message_separator.len, 0);
+            }
+
             if (rc == NGX_OK) {
                 rc = ngx_http_push_stream_send_response_text(r, str->data, str->len, 0);
                 if (rc == NGX_OK) {

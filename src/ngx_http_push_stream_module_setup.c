@@ -177,6 +177,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, footer_template),
         NULL },
+    { ngx_string("push_stream_message_separator"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, message_separator),
+        NULL },
     { ngx_string("push_stream_wildcard_channel_max_qtd"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_num_slot,
@@ -572,6 +578,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->message_template_index = -1;
     ngx_str_null(&lcf->message_template);
     ngx_str_null(&lcf->header_template);
+    ngx_str_null(&lcf->message_separator);
     ngx_str_null(&lcf->footer_template);
     lcf->wildcard_channel_max_qtd = NGX_CONF_UNSET_UINT;
     lcf->location_type = NGX_CONF_UNSET_UINT;
@@ -603,6 +610,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->store_messages, prev->store_messages, 0);
     ngx_conf_merge_str_value(conf->header_template, prev->header_template, NGX_HTTP_PUSH_STREAM_DEFAULT_HEADER_TEMPLATE);
     ngx_conf_merge_str_value(conf->message_template, prev->message_template, NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TEMPLATE);
+    ngx_conf_merge_str_value(conf->message_separator, prev->message_separator, "");
     ngx_conf_merge_str_value(conf->footer_template, prev->footer_template, NGX_HTTP_PUSH_STREAM_DEFAULT_FOOTER_TEMPLATE);
     ngx_conf_merge_uint_value(conf->wildcard_channel_max_qtd, prev->wildcard_channel_max_qtd, mcf->max_number_of_wildcard_channels);
     ngx_conf_merge_msec_value(conf->ping_message_interval, prev->ping_message_interval, NGX_CONF_UNSET_MSEC);
