@@ -119,6 +119,7 @@ typedef struct {
     ngx_str_t                       header_template;
     ngx_str_t                       message_template;
     ngx_int_t                       message_template_index;
+    ngx_str_t                       message_separator;
     ngx_str_t                       footer_template;
     ngx_uint_t                      wildcard_channel_max_qtd;
     ngx_uint_t                      location_type;
