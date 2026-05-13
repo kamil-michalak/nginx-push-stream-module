@@ -206,9 +206,13 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
         ngx_str_t  *ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
-        ngx_uint_t  old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
-            requested_channel->channel, requested_channel->backtrack_messages,
-            if_modified_since, tag, greater_message_time, greater_message_tag, ch_event_id);
+        ngx_uint_t  old_msg_status = NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE;
+
+        if (requested_channel->channel != NULL) {
+            old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
+                requested_channel->channel, requested_channel->backtrack_messages,
+                if_modified_since, tag, greater_message_time, greater_message_tag, ch_event_id);
+        }
 
         if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
             has_message_to_send = 1;
@@ -330,16 +334,18 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
 {
     ngx_http_push_stream_subscription_t        *subscription;
     ngx_slab_pool_t                            *shpool = mcf->shpool;
-    ngx_uint_t                                  old_msg_status;
+    ngx_uint_t                                  old_msg_status = NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE;
 
     if ((subscription = ngx_http_push_stream_create_channel_subscription(r, requested_channel->channel, subscriber)) == NULL) {
         return NGX_ERROR;
     }
 
-    /* check if event_id was given but not found in the buffer */
-    old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
-        requested_channel->channel, requested_channel->backtrack_messages,
-        if_modified_since, tag, 0, -1, last_event_id);
+    /* only call has_old_messages when channel actually exists */
+    if (requested_channel->channel != NULL) {
+        old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
+            requested_channel->channel, requested_channel->backtrack_messages,
+            if_modified_since, tag, 0, -1, last_event_id);
+    }
 
     if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
         && last_event_id != NULL
