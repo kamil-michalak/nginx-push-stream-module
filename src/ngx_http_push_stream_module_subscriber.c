@@ -236,6 +236,7 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                 ngx_http_push_stream_add_polling_headers(r, greater_message_time, greater_message_tag, temp_pool);
                 r->headers_out.status = NGX_HTTP_OK;
                 r->headers_out.content_length_n = -1;
+                ngx_http_send_header(r);
                 ngx_http_push_stream_send_response_content_header(r, cf);
                 ngx_http_push_stream_send_response_text(r, json->data, json->len, 0);
             }
