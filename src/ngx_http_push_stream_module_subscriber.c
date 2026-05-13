@@ -284,11 +284,16 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                 r->headers_out.content_length_n = -1;
                 ngx_http_send_header(r);
                 ngx_http_push_stream_send_response_content_header(r, cf);
-                ngx_http_push_stream_send_response_text(r, json->data, json->len, 0);
+                ngx_http_push_stream_send_response_text(r, json->data, json->len, 1);
             }
 
             if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
-                ngx_http_push_stream_send_response_finalize(r);
+                /* Do NOT call send_response_finalize here - with HTTP/2 and HTTP/3
+                   it may immediately trigger cleanup callbacks and free ctx while
+                   subscriber_handler still holds a reference to ctx->temp_pool.
+                   Return NGX_DONE so the caller (subscriber_handler) destroys
+                   temp_pool safely first, then returns NGX_DONE to nginx which
+                   closes the connection cleanly. */
                 return NGX_DONE;
             }
         }
