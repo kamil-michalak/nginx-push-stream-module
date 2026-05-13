@@ -128,6 +128,40 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
         return result;
     }
 
+    /* For streaming: check unknown event_id BEFORE registering subscriber.
+       If behavior is disconnect, handle here while no subscriber is yet registered
+       and no IPC race can occur. */
+    if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT
+        && last_event_id != NULL) {
+        ngx_array_t *pre_parts = ngx_http_push_stream_split_last_event_ids(r->pool, last_event_id);
+        ngx_uint_t   pre_index = 0;
+        for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+            requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
+            ngx_str_t *ch_eid = ngx_http_push_stream_get_event_id_by_index(pre_parts, pre_index);
+            if (ch_eid != NULL && requested_channel->channel != NULL && requested_channel->id != NULL) {
+                if (ngx_http_push_stream_has_old_messages_to_send(
+                        requested_channel->channel, requested_channel->backtrack_messages,
+                        if_modified_since, tag, 0, -1, ch_eid)
+                    == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND) {
+
+                    ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
+                        NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
+                        + requested_channel->id->len
+                        + ch_eid->len);
+                    if (json != NULL) {
+                        json->len = ngx_sprintf(json->data,
+                            (char *) NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.data,
+                            requested_channel->id, ch_eid) - json->data;
+                        ngx_http_push_stream_send_only_header_response(r, NGX_HTTP_OK, NULL);
+                        ngx_http_push_stream_send_response_text(r, json->data, json->len, 1);
+                    }
+                    return NGX_DONE;
+                }
+            }
+            pre_index++;
+        }
+    }
+
     ctx->padding = ngx_http_push_stream_get_padding_by_user_agent(r);
 
     // stream access
@@ -158,8 +192,11 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
 
         assign_rc = ngx_http_push_stream_subscriber_assign_channel(mcf, cf, r, requested_channel, if_modified_since, tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++), worker_subscriber, ctx->temp_pool);
         if (assign_rc == NGX_DONE) {
-            /* disconnect behavior: JSON error was sent, connection should close.
-               Return NGX_DONE so nginx closes cleanly without accessing r again. */
+            /* disconnect behavior: JSON error was sent, connection should close */
+            if (ctx->temp_pool != NULL) {
+                ngx_destroy_pool(ctx->temp_pool);
+                ctx->temp_pool = NULL;
+            }
             return NGX_DONE;
         }
         if (assign_rc != NGX_OK) {
@@ -203,9 +240,6 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     greater_message_tag = tag;
     greater_message_time = (if_modified_since < 0) ? 0 : if_modified_since;
 
-    // Parse slash-separated per-channel last_event_id values once, reuse in both loops.
-    // Format: "evt_ch1/evt_ch2/..." matching channel order in the subscription path.
-    // Channels with no corresponding entry (or empty entry) fall back to if_modified_since/tag.
     ngx_array_t *event_id_parts = ngx_http_push_stream_split_last_event_ids(temp_pool, last_event_id);
     ngx_uint_t   channel_index  = 0;
 
@@ -236,7 +270,6 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                    && requested_channel->id != NULL
                    && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
 
-            /* build JSON error */
             ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
                 NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
                 + requested_channel->id->len
@@ -258,7 +291,6 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                 ngx_http_push_stream_send_response_finalize(r);
                 return NGX_DONE;
             }
-            /* NOTIFY: treat as no messages - fall through to wait for new ones */
         }
 
         channel_index++;
@@ -357,9 +389,11 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
     if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
         && last_event_id != NULL
         && requested_channel->id != NULL
-        && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
+        && cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_NOTIFY) {
 
-        /* build JSON: {"error":"unknown_event_id","channel":"...","event":"..."} */
+        /* NOTIFY only: send JSON error but keep subscriber registered.
+           DISCONNECT is handled before subscriber registration in subscriber_handler
+           and in polling_handler to avoid IPC race conditions. */
         ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
             NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
             + requested_channel->id->len
@@ -380,17 +414,8 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
             } else {
                 ngx_http_push_stream_send_response_text(r, json->data, json->len, 0);
             }
-
-            if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
-                /* return NGX_DONE - do NOT call finalize here.
-                   The caller checks for NGX_DONE and returns NGX_DONE to nginx,
-                   which closes the connection cleanly without accessing r again.
-                   Calling finalize here and then having the caller also handle
-                   the error causes a double-finalize crash (segfault at 0). */
-                return NGX_DONE;
-            }
         }
-        /* NOTIFY mode: fall through - subscriber is still registered */
+        /* fall through - subscriber is still registered for future messages */
     }
 
     /* send old messages only when found */

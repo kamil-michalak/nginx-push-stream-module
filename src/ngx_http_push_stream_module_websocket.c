@@ -317,6 +317,41 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     // get control values
     ngx_http_push_stream_get_last_received_message_values(r, &if_modified_since, &tag, &last_event_id);
 
+    /* Check unknown event_id DISCONNECT before registering subscriber to avoid IPC race */
+    if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT
+        && last_event_id != NULL) {
+        ngx_array_t *pre_parts = ngx_http_push_stream_split_last_event_ids(ctx->temp_pool, last_event_id);
+        ngx_uint_t   pre_index = 0;
+        for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+            requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
+            ngx_str_t *ch_eid = ngx_http_push_stream_get_event_id_by_index(pre_parts, pre_index);
+            if (ch_eid != NULL && requested_channel->channel != NULL && requested_channel->id != NULL) {
+                if (ngx_http_push_stream_has_old_messages_to_send(
+                        requested_channel->channel, requested_channel->backtrack_messages,
+                        if_modified_since, tag, 0, -1, ch_eid)
+                    == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND) {
+
+                    ngx_str_t *json = ngx_http_push_stream_create_str(ctx->temp_pool,
+                        NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
+                        + requested_channel->id->len + ch_eid->len);
+                    if (json != NULL) {
+                        json->len = ngx_sprintf(json->data,
+                            (char *) NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.data,
+                            requested_channel->id, ch_eid) - json->data;
+                        ngx_str_t *frame = ngx_http_push_stream_get_formatted_websocket_frame(
+                            &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE, 1,
+                            json->data, json->len, ctx->temp_pool);
+                        if (frame != NULL) {
+                            ngx_http_push_stream_send_response_text(r, frame->data, frame->len, 0);
+                        }
+                    }
+                    return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_OK, &NGX_HTTP_PUSH_STREAM_EMPTY);
+                }
+            }
+            pre_index++;
+        }
+    }
+
     // stream access
     if ((worker_subscriber = ngx_http_push_stream_subscriber_prepare_request_to_keep_connected(r)) == NULL) {
         return ngx_http_push_stream_send_websocket_close_frame(r, NGX_HTTP_INTERNAL_SERVER_ERROR, &NGX_HTTP_PUSH_STREAM_EMPTY);
