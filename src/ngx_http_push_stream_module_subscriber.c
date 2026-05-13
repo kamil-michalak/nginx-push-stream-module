@@ -202,11 +202,15 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     ngx_array_t *event_id_parts = ngx_http_push_stream_split_last_event_ids(temp_pool, last_event_id);
     ngx_uint_t   channel_index  = 0;
 
-    // check if has any message to send
+    // check if has any message to send; also detect unknown event_ids per channel
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
+        ngx_str_t  *ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index);
+        ngx_uint_t  old_msg_status = ngx_http_push_stream_has_old_messages_to_send(
+            requested_channel->channel, requested_channel->backtrack_messages,
+            if_modified_since, tag, greater_message_time, greater_message_tag, ch_event_id);
 
-        if (ngx_http_push_stream_has_old_messages_to_send(requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index)) == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
+        if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
             has_message_to_send = 1;
             if (requested_channel->channel->last_message_time > greater_message_time) {
                 greater_message_time = requested_channel->channel->last_message_time;
@@ -216,7 +220,34 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
                     greater_message_tag = requested_channel->channel->last_message_tag;
                 }
             }
+        } else if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NOT_FOUND
+                   && cf->unknown_event_id_behavior != NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE) {
+
+            /* build JSON error */
+            ngx_str_t *json = ngx_http_push_stream_create_str(r->pool,
+                NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.len
+                + requested_channel->id->len
+                + ch_event_id->len);
+            if (json != NULL) {
+                json->len = ngx_sprintf(json->data,
+                    (char *) NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON.data,
+                    requested_channel->id, ch_event_id) - json->data;
+
+                ngx_http_push_stream_add_polling_headers(r, greater_message_time, greater_message_tag, temp_pool);
+                r->headers_out.status = NGX_HTTP_OK;
+                r->headers_out.content_length_n = -1;
+                ngx_http_push_stream_send_response_content_header(r, cf);
+                ngx_http_push_stream_send_response_text(r, json->data, json->len, 0);
+            }
+
+            if (cf->unknown_event_id_behavior == NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_DISCONNECT) {
+                ngx_http_push_stream_send_response_finalize(r);
+                return NGX_DONE;
+            }
+            /* NOTIFY: treat as no messages - fall through to wait for new ones */
         }
+
+        channel_index++;
     }
 
 
