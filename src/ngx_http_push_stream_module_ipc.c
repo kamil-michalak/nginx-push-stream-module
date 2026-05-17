@@ -211,13 +211,22 @@ ngx_http_push_stream_clean_worker_data(ngx_http_push_stream_shm_data_t *data)
     ngx_http_push_stream_channel_t         *channel;
     ngx_http_push_stream_worker_msg_t      *worker_msg;
 
+    /* drain pending IPC messages for this slot */
     while (!ngx_queue_empty(&data->ipc[ngx_process_slot].messages_queue)) {
         cur = ngx_queue_head(&data->ipc[ngx_process_slot].messages_queue);
         worker_msg = ngx_queue_data(cur, ngx_http_push_stream_worker_msg_t, queue);
         ngx_http_push_stream_free_worker_message_memory(shpool, worker_msg);
     }
 
-    ngx_queue_init(&data->ipc[ngx_process_slot].subscribers_queue);
+    /* only reset the subscribers queue if no other process is using this slot.
+       On reload a new worker can start on the same slot while the old one is
+       still alive and shutting down gracefully - zeroing the queue here would
+       corrupt the old worker's subscriber list and prevent clean shutdown,
+       leaving r->main->count incremented and connections stuck in writing state. */
+    if (data->ipc[ngx_process_slot].pid <= 0
+        || data->ipc[ngx_process_slot].pid == ngx_pid) {
+        ngx_queue_init(&data->ipc[ngx_process_slot].subscribers_queue);
+    }
 
     ngx_shmtx_lock(&data->channels_queue_mutex);
     for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
