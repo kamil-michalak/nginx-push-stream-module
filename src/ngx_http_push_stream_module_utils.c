@@ -1002,6 +1002,17 @@ ngx_http_push_stream_send_response_finalize(ngx_http_request_t *r)
         }
     }
 
+    /* clear write_event_handler to prevent nginx from putting this connection
+       back into writing state after finalize - streaming connections set
+       r->write_event_handler = ngx_http_request_empty_handler but nginx http
+       writer may reset it; on reload this leaves ngx_stat_writing incremented
+       permanently (connection stuck in writing state). */
+    r->write_event_handler = ngx_http_request_empty_handler;
+    /* clear buffered flag so ngx_http_finalize_request does not put connection
+       into writer queue which increments ngx_stat_writing */
+    r->buffered = 0;
+    r->connection->buffered = 0;
+
     ngx_http_finalize_request(r, (rc == NGX_ERROR) ? NGX_DONE : NGX_OK);
 }
 
