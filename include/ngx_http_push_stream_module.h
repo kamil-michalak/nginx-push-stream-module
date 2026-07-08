@@ -92,8 +92,6 @@ typedef struct {
     ngx_flag_t                      enabled;
     ngx_str_t                       channel_deleted_message_text;
     time_t                          channel_inactivity_time;
-    ngx_str_t                       ping_message_text;
-    ngx_uint_t                      qtd_templates;
     ngx_str_t                       wildcard_channel_prefix;
     ngx_uint_t                      max_number_of_channels;
     ngx_uint_t                      max_number_of_wildcard_channels;
@@ -105,7 +103,6 @@ typedef struct {
     ngx_flag_t                      timeout_with_body;
     ngx_str_t                       events_channel_id;
     ngx_regex_t                    *backtrack_parser_regex;
-    ngx_http_push_stream_msg_t     *ping_msg;
     ngx_http_push_stream_msg_t     *longpooling_timeout_msg;
     ngx_shm_zone_t                 *shm_zone;
     ngx_slab_pool_t                *shpool;
@@ -127,6 +124,9 @@ typedef struct {
     ngx_msec_t                      subscriber_connection_ttl;
     ngx_msec_t                      longpolling_connection_ttl;
     ngx_flag_t                      websocket_allow_publish;
+    ngx_uint_t                      ping_mode;
+    ngx_str_t                       ping_message_text;
+    ngx_http_push_stream_msg_t     *ping_msg;  /* cached slab msg built from ping_message_text, per location */
     ngx_flag_t                      websocket_allow_resubscribe;
     ngx_uint_t                      websocket_max_channels_per_connection;
     ngx_uint_t                      unknown_event_id_behavior;
@@ -249,6 +249,7 @@ typedef struct {
     ngx_http_push_stream_subscriber_t  *subscriber;
     ngx_flag_t                          longpolling;
     ngx_flag_t                          message_sent;
+    ngx_msec_t                          last_msg_sent;  /* ngx_current_msec when last message was delivered */
     ngx_pool_t                         *temp_pool;
     ngx_chain_t                        *free;
     ngx_chain_t                        *busy;
@@ -404,6 +405,10 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_MODE_WEBSOCKET   = ngx_string("webs
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_LONGPOLLING 2
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE 3
 #define NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET   4
+
+/* push_stream_ping_mode values */
+#define NGX_HTTP_PUSH_STREAM_PING_MODE_NATIVE       0  /* WS: PING frame; SSE: comment; streaming: ping_msg */
+#define NGX_HTTP_PUSH_STREAM_PING_MODE_APPLICATION  1  /* all modes: ping_msg via message_template, skip if recent msg */
 
 /* behavior when subscriber connects with event_id not found in channel buffer */
 #define NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE     0

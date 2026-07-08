@@ -732,7 +732,8 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
             if (rc == NGX_OK) {
                 rc = ngx_http_push_stream_send_response_text(r, str->data, str->len, 0);
                 if (rc == NGX_OK) {
-                    ctx->message_sent = 1;
+                    ctx->message_sent  = 1;
+                    ctx->last_msg_sent = ngx_current_msec;
                 }
             }
 
@@ -1436,20 +1437,48 @@ ngx_http_push_stream_ping_timer_wake_handler(ngx_event_t *ev)
         return;
     }
 
-    if (pslcf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE) {
-        rc = ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_EVENTSOURCE_PING_MESSAGE_CHUNK.data, NGX_HTTP_PUSH_STREAM_EVENTSOURCE_PING_MESSAGE_CHUNK.len, 0);
-    } else if (pslcf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET) {
-        rc = ngx_http_push_stream_send_response_text(r, NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE, sizeof(NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE), 0);
+    if (pslcf->ping_mode == NGX_HTTP_PUSH_STREAM_PING_MODE_NATIVE) {
+        /* original behavior:
+           WebSocket   -> PING frame (0x89) - invisible to JS, browser auto-PONGs
+           EventSource -> ": \n" comment    - invisible to JS
+           streaming   -> ping_msg via message_template */
+        if (pslcf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE) {
+            rc = ngx_http_push_stream_send_response_text(r,
+                NGX_HTTP_PUSH_STREAM_EVENTSOURCE_PING_MESSAGE_CHUNK.data,
+                NGX_HTTP_PUSH_STREAM_EVENTSOURCE_PING_MESSAGE_CHUNK.len, 0);
+        } else if (pslcf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET) {
+            rc = ngx_http_push_stream_send_response_text(r,
+                NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE,
+                sizeof(NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_LAST_FRAME_BYTE), 0);
+        } else {
+            goto send_ping_msg;
+        }
     } else {
-        if (mcf->ping_msg == NULL) {
-            // create ping message
-            if ((mcf->ping_msg == NULL) && (mcf->ping_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, mcf->ping_message_text.data, mcf->ping_message_text.len, NULL, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, r->pool)) == NULL) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate ping message in shared memory");
+        /* application mode:
+           all modes -> ping_msg via message_template -> visible in onmessage.
+           skip ping if a real message was delivered recently. */
+        ngx_msec_t elapsed = (ctx->last_msg_sent > 0)
+            ? (ngx_current_msec - ctx->last_msg_sent)
+            : (ngx_msec_t) pslcf->ping_message_interval + 1;
+
+        if (elapsed < (ngx_msec_t) pslcf->ping_message_interval) {
+            ngx_http_push_stream_timer_reset(pslcf->ping_message_interval, ctx->ping_timer);
+            return;
+        }
+
+        send_ping_msg:
+        if (pslcf->ping_msg == NULL) {
+            if ((pslcf->ping_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(
+                    mcf, pslcf->ping_message_text.data, pslcf->ping_message_text.len,
+                    NULL, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID,
+                    NULL, NULL, 0, 0, r->pool)) == NULL) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "push stream module: unable to allocate ping message in shared memory");
             }
         }
 
-        if (mcf->ping_msg != NULL) {
-            rc = ngx_http_push_stream_send_response_message(r, NULL, mcf->ping_msg, 1, 0);
+        if (pslcf->ping_msg != NULL) {
+            rc = ngx_http_push_stream_send_response_message(r, NULL, pslcf->ping_msg, 1, 0);
         }
     }
 

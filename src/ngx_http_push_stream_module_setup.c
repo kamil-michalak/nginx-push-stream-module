@@ -35,6 +35,12 @@ static ngx_conf_enum_t  ngx_http_push_stream_unknown_event_id_behaviors[] = {
     { ngx_null_string, 0 }
 };
 
+static ngx_conf_enum_t  ngx_http_push_stream_ping_modes[] = {
+    { ngx_string("native"),      NGX_HTTP_PUSH_STREAM_PING_MODE_NATIVE },
+    { ngx_string("application"), NGX_HTTP_PUSH_STREAM_PING_MODE_APPLICATION },
+    { ngx_null_string, 0 }
+};
+
 static ngx_command_t    ngx_http_push_stream_commands[] = {
     { ngx_string("push_stream_channels_statistics"),
         NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
@@ -75,10 +81,10 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         offsetof(ngx_http_push_stream_main_conf_t, channel_inactivity_time),
         NULL },
     { ngx_string("push_stream_ping_message_text"),
-        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_str_slot,
-        NGX_HTTP_MAIN_CONF_OFFSET,
-        offsetof(ngx_http_push_stream_main_conf_t, ping_message_text),
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, ping_message_text),
         NULL },
     { ngx_string("push_stream_timeout_with_body"),
         NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
@@ -220,6 +226,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, websocket_allow_publish),
         NULL },
+    { ngx_string("push_stream_ping_mode"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_enum_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, ping_mode),
+        &ngx_http_push_stream_ping_modes },
     { ngx_string("push_stream_websocket_allow_resubscribe"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_flag_slot,
@@ -484,7 +496,6 @@ ngx_http_push_stream_create_main_conf(ngx_conf_t *cf)
     mcf->enabled = 0;
     ngx_str_null(&mcf->channel_deleted_message_text);
     mcf->channel_inactivity_time = NGX_CONF_UNSET;
-    ngx_str_null(&mcf->ping_message_text);
     ngx_str_null(&mcf->wildcard_channel_prefix);
     mcf->max_number_of_channels = NGX_CONF_UNSET_UINT;
     mcf->max_number_of_wildcard_channels = NGX_CONF_UNSET_UINT;
@@ -495,7 +506,6 @@ ngx_http_push_stream_create_main_conf(ngx_conf_t *cf)
     mcf->qtd_templates = 0;
     mcf->timeout_with_body = NGX_CONF_UNSET;
     ngx_str_null(&mcf->events_channel_id);
-    mcf->ping_msg = NULL;
     mcf->longpooling_timeout_msg = NULL;
     ngx_queue_init(&mcf->msg_templates);
 
@@ -515,7 +525,6 @@ ngx_http_push_stream_init_main_conf(ngx_conf_t *cf, void *parent)
     ngx_conf_init_value(conf->message_ttl, NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TTL);
     ngx_conf_init_value(conf->channel_inactivity_time, NGX_HTTP_PUSH_STREAM_DEFAULT_CHANNEL_INACTIVITY_TIME);
     ngx_conf_merge_str_value(conf->channel_deleted_message_text, conf->channel_deleted_message_text, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT);
-    ngx_conf_merge_str_value(conf->ping_message_text, conf->ping_message_text, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_TEXT);
     ngx_conf_merge_str_value(conf->wildcard_channel_prefix, conf->wildcard_channel_prefix, NGX_HTTP_PUSH_STREAM_DEFAULT_WILDCARD_CHANNEL_PREFIX);
     ngx_conf_merge_str_value(conf->events_channel_id, conf->events_channel_id, NGX_HTTP_PUSH_STREAM_DEFAULT_EVENTS_CHANNEL_ID);
     ngx_conf_init_value(conf->timeout_with_body, 0);
@@ -611,6 +620,9 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->subscriber_connection_ttl = NGX_CONF_UNSET_MSEC;
     lcf->longpolling_connection_ttl = NGX_CONF_UNSET_MSEC;
     lcf->websocket_allow_publish = NGX_CONF_UNSET_UINT;
+    lcf->ping_mode               = NGX_CONF_UNSET_UINT;
+    ngx_str_null(&lcf->ping_message_text);
+    lcf->ping_msg = NULL;
     lcf->websocket_allow_resubscribe = NGX_CONF_UNSET_UINT;
     lcf->websocket_max_channels_per_connection = NGX_CONF_UNSET_UINT;
     lcf->unknown_event_id_behavior = NGX_CONF_UNSET_UINT;
@@ -645,6 +657,8 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->subscriber_connection_ttl, prev->subscriber_connection_ttl, NGX_CONF_UNSET_MSEC);
     ngx_conf_merge_msec_value(conf->longpolling_connection_ttl, prev->longpolling_connection_ttl, conf->subscriber_connection_ttl);
     ngx_conf_merge_value(conf->websocket_allow_publish, prev->websocket_allow_publish, 0);
+    ngx_conf_merge_uint_value(conf->ping_mode, prev->ping_mode, NGX_HTTP_PUSH_STREAM_PING_MODE_NATIVE);
+    ngx_conf_merge_str_value(conf->ping_message_text, prev->ping_message_text, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_TEXT);
     ngx_conf_merge_value(conf->websocket_allow_resubscribe, prev->websocket_allow_resubscribe, 0);
     ngx_conf_merge_uint_value(conf->websocket_max_channels_per_connection, prev->websocket_max_channels_per_connection, NGX_CONF_UNSET_UINT);
     ngx_conf_merge_uint_value(conf->unknown_event_id_behavior, prev->unknown_event_id_behavior, NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE);
@@ -1088,13 +1102,9 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         d = (ngx_http_push_stream_shm_data_t *) data;
 
         /* transfer pre-allocated shared messages from the old mcf to the new one
-           so they are reused instead of re-created (and the old ones leaked) */
+           so they are reused instead of re-created (and the old ones leaked).
+           Note: ping_msg is now per loc_conf, not mcf - no transfer needed here. */
         if (d->mcf != NULL) {
-            if (mcf->ping_msg == NULL && d->mcf->ping_msg != NULL) {
-                mcf->ping_msg = d->mcf->ping_msg;
-            } else if (d->mcf->ping_msg != NULL && d->mcf->ping_msg != mcf->ping_msg) {
-                ngx_http_push_stream_free_message_memory(mcf->shpool, d->mcf->ping_msg);
-            }
             if (mcf->longpooling_timeout_msg == NULL && d->mcf->longpooling_timeout_msg != NULL) {
                 mcf->longpooling_timeout_msg = d->mcf->longpooling_timeout_msg;
             } else if (d->mcf->longpooling_timeout_msg != NULL && d->mcf->longpooling_timeout_msg != mcf->longpooling_timeout_msg) {
