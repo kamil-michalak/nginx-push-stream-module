@@ -100,6 +100,7 @@ typedef struct {
     ngx_uint_t                      max_messages_stored_per_channel;
     ngx_uint_t                      max_channel_id_length;
     ngx_queue_t                     msg_templates;
+    ngx_uint_t                      qtd_templates;
     ngx_flag_t                      timeout_with_body;
     ngx_str_t                       events_channel_id;
     ngx_regex_t                    *backtrack_parser_regex;
