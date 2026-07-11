@@ -52,6 +52,75 @@ ngx_http_push_stream_websocket_send_ack(ngx_http_request_t *r,
 }
 
 
+/*
+ * Handle "?" ping command.
+ * Client sends: ?<optional_payload_max_100_chars>
+ * Server responds: {"pong":"<payload>","ts":<epoch_ms>}
+ *
+ * Payload is truncated to NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_PAYLOAD_MAX chars.
+ * No JSON-escaping of payload is done - restrict to printable ASCII in channel names.
+ * For safety, only printable ASCII (0x20-0x7E) is allowed in payload; others are stripped.
+ */
+static void
+ngx_http_push_stream_websocket_handle_ping(ngx_http_request_t *r,
+    u_char *payload, size_t payload_len)
+{
+    ngx_str_t   safe_payload;
+    u_char      safe_buf[NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_PAYLOAD_MAX + 1];
+    ngx_str_t  *json;
+    ngx_str_t  *frame;
+    ngx_time_t *tp;
+    size_t      i, out = 0;
+    size_t      limit;
+    u_char     *p;
+
+    /* skip the '?' prefix, take up to PING_PAYLOAD_MAX bytes */
+    limit = (payload_len > NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_PAYLOAD_MAX)
+            ? (size_t) NGX_HTTP_PUSH_STREAM_WEBSOCKET_PING_PAYLOAD_MAX
+            : payload_len;
+
+    /* keep only printable ASCII to avoid JSON injection */
+    for (i = 0; i < limit; i++) {
+        u_char c = payload[i];
+        if (c >= 0x20 && c <= 0x7E && c != '"' && c != '\\') {
+            safe_buf[out++] = c;
+        }
+    }
+    safe_payload.data = safe_buf;
+    safe_payload.len  = out;
+
+    /* epoch ms: tp->sec (unix timestamp) * 1000 + tp->msec */
+    tp = ngx_timeofday();
+
+    /* {"pong":"<payload>","ts":<epoch_ms>}
+       max size: 11 + 100 + 9 + 13 + 1 = ~135 bytes */
+    json = ngx_http_push_stream_create_str(r->pool, 11 + safe_payload.len + 22);
+    if (json == NULL) return;
+
+    p = json->data;
+    p = ngx_cpymem(p, "{\"pong\":\"", 9);
+    if (safe_payload.len > 0) {
+        p = ngx_cpymem(p, safe_payload.data, safe_payload.len);
+    }
+    p = ngx_cpymem(p, "\",\"ts\":", 7);
+    /* append epoch seconds */
+    p = ngx_sprintf(p, (u_char *) "%T", tp->sec);
+    /* append zero-padded milliseconds (always 3 digits) */
+    *p++ = (u_char) ('0' + tp->msec / 100);
+    *p++ = (u_char) ('0' + tp->msec % 100 / 10);
+    *p++ = (u_char) ('0' + tp->msec % 10);
+    *p++ = '}';
+    json->len = p - json->data;
+
+    frame = ngx_http_push_stream_get_formatted_websocket_frame(
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_BYTE, 1,
+        json->data, json->len, r->pool);
+    if (frame != NULL) {
+        ngx_http_push_stream_send_response_text(r, frame->data, frame->len, 0);
+    }
+}
+
+
 /* Handle "+channel_name" or "+channel_name:event_id" */
 static void
 ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
@@ -687,11 +756,17 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     if (ctx->frame->last_fragment && (ctx->frame->opcode == NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_OPCODE) && ctx->frame->payload_len > 1) {
                         u_char cmd = ctx->frame->payload[0];
 
+                        /* ping command: "?" or "?<payload>" - always available, no config needed */
+                        if (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_PING) {
+                            u_char *ping_body     = ctx->frame->payload + 1;
+                            size_t  ping_body_len = ctx->frame->payload_len - 1;
+                            ngx_http_push_stream_websocket_handle_ping(r, ping_body, ping_body_len);
+                            goto next_frame;
+
                         /* dynamic subscribe/unsubscribe - independent of allow_publish */
-                        if (cf->websocket_allow_resubscribe
+                        } else if (cf->websocket_allow_resubscribe
                             && (cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE
                                 || cmd == NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE)) {
-
                             u_char    *body     = ctx->frame->payload + 1;
                             size_t     body_len = ctx->frame->payload_len - 1;
                             ngx_str_t  channel_id;
@@ -738,7 +813,8 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         /* normal publish to all subscribed channels */
                         } else if (cf->websocket_allow_publish
                                    && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE
-                                   && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE) {
+                                   && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE
+                                   && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_PING) {
                             for (q = ngx_queue_head(&ctx->subscriber->subscriptions); q != ngx_queue_sentinel(&ctx->subscriber->subscriptions); q = ngx_queue_next(q)) {
                                 ngx_http_push_stream_subscription_t *subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
                                 if (subscription->channel->for_events) {
