@@ -104,7 +104,7 @@ ngx_http_push_stream_websocket_handle_ping(ngx_http_request_t *r,
     }
     p = ngx_cpymem(p, "\",\"ts\":", 7);
     /* append epoch seconds */
-    p = ngx_sprintf(p, (u_char *) "%T", tp->sec);
+    p = ngx_sprintf(p, (char *) "%T", tp->sec);
     /* append zero-padded milliseconds (always 3 digits) */
     *p++ = (u_char) ('0' + tp->msec / 100);
     *p++ = (u_char) ('0' + tp->msec % 100 / 10);
