@@ -111,6 +111,13 @@ typedef struct {
     ngx_http_push_stream_shm_data_t*shm_data;
 } ngx_http_push_stream_main_conf_t;
 
+/* one entry for push_stream_websocket_extra_header directive:
+   header name (static) + value (nginx complex value, may contain variables) */
+typedef struct {
+    ngx_str_t                       name;
+    ngx_http_complex_value_t        value;
+} ngx_http_push_stream_extra_header_t;
+
 typedef struct {
     ngx_http_complex_value_t       *channels_path;
     ngx_uint_t                      authorized_channels_only;
@@ -126,6 +133,7 @@ typedef struct {
     ngx_msec_t                      subscriber_connection_ttl;
     ngx_msec_t                      longpolling_connection_ttl;
     ngx_flag_t                      websocket_allow_publish;
+    ngx_array_t                     *websocket_extra_headers;  /* array of ngx_http_push_stream_extra_header_t */
     ngx_uint_t                      ping_mode;
     ngx_str_t                       ping_message_text;
     ngx_http_push_stream_msg_t     *ping_msg;  /* cached slab msg built from ping_message_text, per location */

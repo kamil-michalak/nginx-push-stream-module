@@ -367,6 +367,24 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
             (ngx_str_t *) &NGX_HTTP_PUSH_STREAM_WEBSOCKET_PERMESSAGE_DEFLATE);
     }
 #endif
+
+    /* push_stream_websocket_extra_header entries - evaluated as complex
+       values (may reference nginx variables like $hostname) and added
+       through the module's own safe header path. This exists because
+       plain nginx `add_header` cannot be applied to this hand-built
+       101 response without breaking the WebSocket handshake (see comment
+       in ngx_http_push_stream_set_websocket_extra_header). */
+    if (cf->websocket_extra_headers != NULL) {
+        ngx_http_push_stream_extra_header_t *headers = cf->websocket_extra_headers->elts;
+        ngx_uint_t hi;
+        for (hi = 0; hi < cf->websocket_extra_headers->nelts; hi++) {
+            ngx_str_t value;
+            if (ngx_http_complex_value(r, &headers[hi].value, &value) == NGX_OK && value.len > 0) {
+                ngx_http_push_stream_add_response_header(r, &headers[hi].name, &value);
+            }
+        }
+    }
+
     r->headers_out.status_line = NGX_HTTP_PUSH_STREAM_101_STATUS_LINE;
 
     ngx_http_push_stream_send_only_added_headers(r);

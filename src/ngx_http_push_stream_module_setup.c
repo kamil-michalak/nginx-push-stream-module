@@ -232,6 +232,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, websocket_allow_publish),
         NULL },
+    { ngx_string("push_stream_websocket_extra_header"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+        ngx_http_push_stream_set_websocket_extra_header,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL },
     { ngx_string("push_stream_ping_mode"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_enum_slot,
@@ -628,6 +634,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->subscriber_connection_ttl = NGX_CONF_UNSET_MSEC;
     lcf->longpolling_connection_ttl = NGX_CONF_UNSET_MSEC;
     lcf->websocket_allow_publish = NGX_CONF_UNSET_UINT;
+    lcf->websocket_extra_headers = NGX_CONF_UNSET_PTR;
     lcf->ping_mode               = NGX_CONF_UNSET_UINT;
     ngx_str_null(&lcf->ping_message_text);
     lcf->ping_msg = NULL;
@@ -665,6 +672,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->subscriber_connection_ttl, prev->subscriber_connection_ttl, NGX_CONF_UNSET_MSEC);
     ngx_conf_merge_msec_value(conf->longpolling_connection_ttl, prev->longpolling_connection_ttl, conf->subscriber_connection_ttl);
     ngx_conf_merge_value(conf->websocket_allow_publish, prev->websocket_allow_publish, 0);
+    ngx_conf_merge_ptr_value(conf->websocket_extra_headers, prev->websocket_extra_headers, NULL);
     ngx_conf_merge_uint_value(conf->ping_mode, prev->ping_mode, NGX_HTTP_PUSH_STREAM_PING_MODE_NATIVE);
     ngx_conf_merge_str_value(conf->ping_message_text, prev->ping_message_text, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_TEXT);
     ngx_conf_merge_value(conf->websocket_allow_resubscribe, prev->websocket_allow_resubscribe, 0);
@@ -997,6 +1005,62 @@ ngx_http_push_stream_set_shm_size_slot(ngx_conf_t *cf, ngx_command_t *cmd, void 
 
     mcf->shm_zone->init = ngx_http_push_stream_init_shm_zone;
     mcf->shm_zone->data = mcf;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * push_stream_websocket_extra_header <Header-Name> <value>;
+ *
+ * Adds a custom header to the WebSocket 101 Switching Protocols response.
+ * <value> is parsed as an nginx complex value, so it may contain variables
+ * (e.g. $hostname, or a variable set via `map`).
+ *
+ * This exists because standard `add_header` directives cannot safely be
+ * applied to this module's hand-built 101 response: routing the response
+ * through nginx's normal header filter chain (ngx_http_send_header) causes
+ * nginx core to emit its own Connection header based on r->keepalive,
+ * which conflicts with the module's own "Connection: Upgrade" header and
+ * breaks the WebSocket handshake. This directive instead evaluates the
+ * value at request time and adds it through the module's own safe header
+ * path (the same one used for Upgrade/Connection/Sec-WebSocket-Accept).
+ *
+ * Multiple occurrences are allowed, same as add_header.
+ */
+char *
+ngx_http_push_stream_set_websocket_extra_header(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_push_stream_loc_conf_t        *lcf = conf;
+    ngx_http_push_stream_extra_header_t    *header;
+    ngx_http_compile_complex_value_t        ccv;
+    ngx_str_t                              *value;
+
+    if (lcf->websocket_extra_headers == NGX_CONF_UNSET_PTR || lcf->websocket_extra_headers == NULL) {
+        lcf->websocket_extra_headers = ngx_array_create(cf->pool, 2, sizeof(ngx_http_push_stream_extra_header_t));
+        if (lcf->websocket_extra_headers == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    header = ngx_array_push(lcf->websocket_extra_headers);
+    if (header == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    ngx_memzero(header, sizeof(ngx_http_push_stream_extra_header_t));
+
+    value = cf->args->elts;
+
+    header->name = value[1];
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = &header->value;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }

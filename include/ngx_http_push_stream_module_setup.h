@@ -75,6 +75,7 @@ static char *       ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *pa
 
 // shared memory
 char *              ngx_http_push_stream_set_shm_size_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *              ngx_http_push_stream_set_websocket_extra_header(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 ngx_int_t           ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data);
 ngx_int_t           ngx_http_push_stream_init_global_shm_zone(ngx_shm_zone_t *shm_zone, void *data);
 
