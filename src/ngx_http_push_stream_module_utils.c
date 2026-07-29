@@ -219,10 +219,40 @@ static ngx_inline void
 ngx_http_push_stream_cleanup_shutting_down_worker_data(ngx_http_push_stream_shm_data_t *data)
 {
     ngx_http_push_stream_worker_data_t          *thisworker_data = data->ipc + ngx_process_slot;
-    ngx_queue_t                                 *q;
+    ngx_queue_t                                 *q, *prev_head = NULL;
+    ngx_uint_t                                    stall_count = 0;
 
+    /*
+     * This loop relies on send_response_finalize() -> cleanup_request_context()
+     * -> worker_subscriber_cleanup() removing the subscriber from
+     * thisworker_data->subscribers_queue as a side effect. If that chain
+     * does not run for some reason, the queue head never changes and this
+     * becomes an infinite loop, hanging the worker at 100% CPU during
+     * "nginx -s reload".
+     *
+     * Guard: if the head is the same object as last iteration, force-remove
+     * it directly and log an error, instead of spinning forever.
+     */
     while (!ngx_queue_empty(&thisworker_data->subscribers_queue)) {
         q = ngx_queue_head(&thisworker_data->subscribers_queue);
+
+        if (q == prev_head) {
+            stall_count++;
+            if (stall_count >= 2) {
+                ngx_http_push_stream_subscriber_t *stuck = ngx_queue_data(q, ngx_http_push_stream_subscriber_t, worker_queue);
+                ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                    "push stream module: subscriber stuck in shutdown cleanup queue "
+                    "(finalize did not remove it) - forcing removal to avoid worker hang");
+                ngx_queue_remove(&stuck->worker_queue);
+                stall_count = 0;
+                prev_head = NULL;
+                continue;
+            }
+        } else {
+            stall_count = 0;
+        }
+        prev_head = q;
+
         ngx_http_push_stream_subscriber_t *subscriber = ngx_queue_data(q, ngx_http_push_stream_subscriber_t, worker_queue);
         if (subscriber->longpolling) {
             ngx_http_push_stream_send_response_finalize_for_longpolling_by_timeout(subscriber->request);
@@ -1145,8 +1175,14 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
     ngx_queue_t                        *q;
     ngx_pool_t                         *temp_pool = NULL;
     /* channels with subscribers that need deletion - collected while locked,
-       processed after unlocking to avoid calling delete_channel under mutex */
-#define NGX_PS_MAX_DELETE_BATCH  64
+       processed after unlocking to avoid calling delete_channel under mutex.
+       Kept small on purpose: each deletion sends an IPC alert (ngx_write_channel)
+       to every worker with a subscriber on that channel. ngx_write_channel can
+       block if the receiving worker's socketpair buffer is full (e.g. that
+       worker is itself busy, or shutting down during a reload). A large batch
+       here risks a burst of blocking writes across many channels at once,
+       which can cascade into multiple workers hanging simultaneously. */
+#define NGX_PS_MAX_DELETE_BATCH  8
     ngx_http_push_stream_channel_t     *to_delete[NGX_PS_MAX_DELETE_BATCH];
     ngx_uint_t                          to_delete_count = 0;
 
@@ -1182,11 +1218,20 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
                 ngx_http_push_stream_send_event(mcf, ngx_cycle->log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CHANNEL_DESTROYED, temp_pool);
 
             } else if (mcf->channel_inactivity_delete_with_subscribers
+                       && !ngx_exiting
+                       && !ngx_terminate
+                       && !ngx_quit
                        && !channel->deleted
                        && to_delete_count < NGX_PS_MAX_DELETE_BATCH) {
                 /* new path: has subscribers but channel is inactive and empty.
                    Collect for deletion - must call delete_channel AFTER releasing
-                   the channels_queue_mutex to avoid deadlock. */
+                   the channels_queue_mutex to avoid deadlock.
+                   Skipped entirely while this worker is shutting down: during
+                   reload, cleanup_shutting_down_worker_data() will force-close
+                   every subscriber on this worker anyway, so there is nothing
+                   to gain here and doing it risks racing with that shutdown
+                   path (and the IPC alert below could block if a sibling
+                   worker is also mid-shutdown and not draining its channel). */
                 to_delete[to_delete_count++] = channel;
             }
         }
