@@ -1202,11 +1202,21 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
     ngx_http_push_stream_channel_t     *to_delete[NGX_PS_MAX_DELETE_BATCH];
     ngx_uint_t                          to_delete_count = 0;
 
-    if (mcf->events_channel_id.len > 0) {
-        if ((temp_pool = ngx_create_pool(4096, ngx_cycle->log)) == NULL) {
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push stream module: unable to allocate memory to temporary pool");
-            return;
-        }
+    /*
+     * temp_pool is used both by the (optional) events_channel feature AND by
+     * ngx_http_push_stream_delete_channel() -> convert_char_to_msg_on_shared(),
+     * which is now called unconditionally from the "has subscribers" deletion
+     * path below via push_stream_channel_inactivity_delete_with_subscribers.
+     * convert_char_to_msg_on_shared() dereferences temp_pool (ngx_palloc et al.)
+     * without a NULL check, so passing NULL here is a guaranteed segfault
+     * whenever events_channel_id is not configured - which crashed every
+     * worker that hit this path (visible as SIGSEGV + a permanently stuck
+     * shared memory mutex, since the crash happens mid-critical-section).
+     * Always create the pool, regardless of events_channel_id.
+     */
+    if ((temp_pool = ngx_create_pool(4096, ngx_cycle->log)) == NULL) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push stream module: unable to allocate memory to temporary pool");
+        return;
     }
 
     ngx_http_push_stream_collect_expired_messages_data(data, force);
