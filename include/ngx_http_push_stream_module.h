@@ -92,6 +92,7 @@ typedef struct {
     ngx_flag_t                      enabled;
     ngx_str_t                       channel_deleted_message_text;
     time_t                          channel_inactivity_time;
+    ngx_flag_t                      channel_inactivity_delete_with_subscribers;
     ngx_str_t                       wildcard_channel_prefix;
     ngx_uint_t                      max_number_of_channels;
     ngx_uint_t                      max_number_of_wildcard_channels;

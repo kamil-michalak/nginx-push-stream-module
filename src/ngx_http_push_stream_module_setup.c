@@ -80,6 +80,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_MAIN_CONF_OFFSET,
         offsetof(ngx_http_push_stream_main_conf_t, channel_inactivity_time),
         NULL },
+    { ngx_string("push_stream_channel_inactivity_delete_with_subscribers"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_flag_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_main_conf_t, channel_inactivity_delete_with_subscribers),
+        NULL },
     { ngx_string("push_stream_ping_message_text"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_str_slot,
@@ -496,6 +502,7 @@ ngx_http_push_stream_create_main_conf(ngx_conf_t *cf)
     mcf->enabled = 0;
     ngx_str_null(&mcf->channel_deleted_message_text);
     mcf->channel_inactivity_time = NGX_CONF_UNSET;
+    mcf->channel_inactivity_delete_with_subscribers = NGX_CONF_UNSET;
     ngx_str_null(&mcf->wildcard_channel_prefix);
     mcf->max_number_of_channels = NGX_CONF_UNSET_UINT;
     mcf->max_number_of_wildcard_channels = NGX_CONF_UNSET_UINT;
@@ -524,6 +531,7 @@ ngx_http_push_stream_init_main_conf(ngx_conf_t *cf, void *parent)
 
     ngx_conf_init_value(conf->message_ttl, NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TTL);
     ngx_conf_init_value(conf->channel_inactivity_time, NGX_HTTP_PUSH_STREAM_DEFAULT_CHANNEL_INACTIVITY_TIME);
+    ngx_conf_init_value(conf->channel_inactivity_delete_with_subscribers, 0);
     ngx_conf_merge_str_value(conf->channel_deleted_message_text, conf->channel_deleted_message_text, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT);
     ngx_conf_merge_str_value(conf->wildcard_channel_prefix, conf->wildcard_channel_prefix, NGX_HTTP_PUSH_STREAM_DEFAULT_WILDCARD_CHANNEL_PREFIX);
     ngx_conf_merge_str_value(conf->events_channel_id, conf->events_channel_id, NGX_HTTP_PUSH_STREAM_DEFAULT_EVENTS_CHANNEL_ID);

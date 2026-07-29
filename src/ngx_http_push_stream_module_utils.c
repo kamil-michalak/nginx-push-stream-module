@@ -1144,6 +1144,11 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
     ngx_http_push_stream_channel_t     *channel;
     ngx_queue_t                        *q;
     ngx_pool_t                         *temp_pool = NULL;
+    /* channels with subscribers that need deletion - collected while locked,
+       processed after unlocking to avoid calling delete_channel under mutex */
+#define NGX_PS_MAX_DELETE_BATCH  64
+    ngx_http_push_stream_channel_t     *to_delete[NGX_PS_MAX_DELETE_BATCH];
+    ngx_uint_t                          to_delete_count = 0;
 
     if (mcf->events_channel_id.len > 0) {
         if ((temp_pool = ngx_create_pool(4096, ngx_cycle->log)) == NULL) {
@@ -1159,23 +1164,54 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
         channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
         q = ngx_queue_next(q);
 
-        if ((channel->stored_messages == 0) && (channel->subscribers == 0) && (channel->expires < ngx_time()) && !channel->for_events) {
-            channel->deleted = 1;
-            channel->expires = ngx_time() + NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL;
-            (channel->wildcard) ? NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->wildcard_channels) : NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->channels);
+        if ((channel->stored_messages == 0) && (channel->expires < ngx_time()) && !channel->for_events) {
 
-            // move the channel to trash queue
-            ngx_rbtree_delete(&data->tree, &channel->node);
-            ngx_queue_remove(&channel->queue);
-            ngx_shmtx_lock(&data->channels_trash_mutex);
-            ngx_queue_insert_tail(&data->channels_trash, &channel->queue);
-            data->channels_in_trash++;
-            ngx_shmtx_unlock(&data->channels_trash_mutex);
+            if (channel->subscribers == 0) {
+                /* standard path: no subscribers - move directly to trash */
+                channel->deleted = 1;
+                channel->expires = ngx_time() + NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL;
+                (channel->wildcard) ? NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->wildcard_channels) : NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->channels);
 
-            ngx_http_push_stream_send_event(mcf, ngx_cycle->log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CHANNEL_DESTROYED, temp_pool);
+                ngx_rbtree_delete(&data->tree, &channel->node);
+                ngx_queue_remove(&channel->queue);
+                ngx_shmtx_lock(&data->channels_trash_mutex);
+                ngx_queue_insert_tail(&data->channels_trash, &channel->queue);
+                data->channels_in_trash++;
+                ngx_shmtx_unlock(&data->channels_trash_mutex);
+
+                ngx_http_push_stream_send_event(mcf, ngx_cycle->log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CHANNEL_DESTROYED, temp_pool);
+
+            } else if (mcf->channel_inactivity_delete_with_subscribers
+                       && !channel->deleted
+                       && to_delete_count < NGX_PS_MAX_DELETE_BATCH) {
+                /* new path: has subscribers but channel is inactive and empty.
+                   Collect for deletion - must call delete_channel AFTER releasing
+                   the channels_queue_mutex to avoid deadlock. */
+                to_delete[to_delete_count++] = channel;
+            }
         }
     }
     ngx_shmtx_unlock(&data->channels_queue_mutex);
+
+    /* delete inactive channels that still have subscribers:
+       delete_channel sends channel_deleted_message to each subscriber,
+       finalizes their requests and moves channel to channels_to_delete queue */
+    for (ngx_uint_t i = 0; i < to_delete_count; i++) {
+        channel = to_delete[i];
+        /* guard: verify channel is still in active queue (not already deleted
+           by another worker between unlock above and now) */
+        if (!channel->deleted) {
+            ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                "push stream module: deleting inactive channel \"%V\" "
+                "with %ui subscriber(s) still connected",
+                &channel->id, channel->subscribers);
+
+            ngx_http_push_stream_delete_channel(mcf, channel,
+                (u_char *) NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT,
+                ngx_strlen(NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT),
+                temp_pool);
+        }
+    }
 
     if (temp_pool != NULL) {
         ngx_destroy_pool(temp_pool);
