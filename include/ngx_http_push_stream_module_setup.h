@@ -40,6 +40,12 @@ static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_INTERVAL    = 4000
 static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TTL                    = 1800;    // 30 minutes
 static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_CHANNEL_INACTIVITY_TIME        = 30;      // 30 seconds
 
+/* Extra margin (seconds) required beyond channel_inactivity_time before a channel
+   WITH subscribers is deleted by channel_inactivity_delete_with_subscribers.
+   Protects against tearing down active connections due to a single delayed/late
+   "keepalive" publish (network jitter, transient load, etc.). */
+#define NGX_HTTP_PUSH_STREAM_INACTIVITY_GRACE_PERIOD 30   // 30 seconds
+
 #define NGX_HTTP_PUSH_STREAM_DEFAULT_HEADER_TEMPLATE  ""
 #define NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TEMPLATE "~text~"
 #define NGX_HTTP_PUSH_STREAM_DEFAULT_FOOTER_TEMPLATE  ""

@@ -1112,16 +1112,22 @@ ngx_http_push_stream_delete_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_h
     ngx_queue_t                            *q;
     ngx_flag_t                              deleted = 0;
 
+    /*
+     * convert_char_to_msg_on_shared() does template formatting and shared-memory
+     * (slab) allocation - meaningfully slower than the simple pointer/counter
+     * bookkeeping below. This lock is needed by every publish (get_channel())
+     * and subscribe request, so holding it across a slab allocation serializes
+     * unrelated publish/subscribe traffic behind it. Rare for the pre-existing
+     * publisher-triggered DELETE endpoint, but frequent when this function is
+     * called automatically and repeatedly by
+     * push_stream_channel_inactivity_delete_with_subscribers - causing publish
+     * requests on other workers to stall/timeout waiting for the lock.
+     *
+     * Fix: fast "claim" under the lock (check+set deleted, unlink, decrement
+     * counters), slab allocation for channel_deleted_message OUTSIDE the lock.
+     */
     ngx_shmtx_lock(&data->channels_queue_mutex);
     if ((channel != NULL) && !channel->deleted) {
-        // apply channel deleted message text to message template
-        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool)) == NULL) {
-            ngx_shmtx_unlock(&data->channels_queue_mutex);
-
-            ngx_log_error(NGX_LOG_ERR, temp_pool->log, 0, "push stream module: unable to allocate memory to channel deleted message");
-            return -1;
-        }
-
         deleted = 1;
         channel->deleted = 1;
         (channel->wildcard) ? NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->wildcard_channels) : NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->channels);
@@ -1131,6 +1137,16 @@ ngx_http_push_stream_delete_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_h
         ngx_queue_remove(&channel->queue);
     }
     ngx_shmtx_unlock(&data->channels_queue_mutex);
+
+    if (deleted) {
+        // apply channel deleted message text to message template - outside the lock
+        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool)) == NULL) {
+            ngx_log_error(NGX_LOG_ERR, temp_pool->log, 0, "push stream module: unable to allocate memory to channel deleted message");
+            /* channel is already unlinked and marked deleted - it will still be
+               processed by delete_channels_data()/collect_deleted_channels_data(),
+               subscribers just won't get a channel_deleted_message body. */
+        }
+    }
 
     if (deleted) {
         // move the channel to unrecoverable queue
@@ -1182,7 +1198,7 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
        worker is itself busy, or shutting down during a reload). A large batch
        here risks a burst of blocking writes across many channels at once,
        which can cascade into multiple workers hanging simultaneously. */
-#define NGX_PS_MAX_DELETE_BATCH  8
+#define NGX_PS_MAX_DELETE_BATCH  3
     ngx_http_push_stream_channel_t     *to_delete[NGX_PS_MAX_DELETE_BATCH];
     ngx_uint_t                          to_delete_count = 0;
 
@@ -1222,6 +1238,11 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
                        && !ngx_terminate
                        && !ngx_quit
                        && !channel->deleted
+                       /* grace period: require the channel to be expired by more than
+                          just the raw threshold before disconnecting live subscribers.
+                          A single delayed/late "keepalive" publish should not be enough
+                          to tear down an otherwise-active connection. */
+                       && (channel->expires < (ngx_time() - NGX_HTTP_PUSH_STREAM_INACTIVITY_GRACE_PERIOD))
                        && to_delete_count < NGX_PS_MAX_DELETE_BATCH) {
                 /* new path: has subscribers but channel is inactive and empty.
                    Collect for deletion - must call delete_channel AFTER releasing
