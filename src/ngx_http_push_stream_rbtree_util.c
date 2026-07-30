@@ -128,14 +128,14 @@ ngx_http_push_stream_get_channel(ngx_str_t *id, ngx_log_t *log, ngx_http_push_st
 
     if ((channel = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_channel_t))) == NULL) {
         ngx_shmtx_unlock(&data->channels_queue_mutex);
-        ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate memory for new channel");
+        ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate memory for new channel (%uz bytes requested)", sizeof(ngx_http_push_stream_channel_t));
         return NULL;
     }
 
     if ((channel->id.data = ngx_slab_alloc(shpool, id->len + 1)) == NULL) {
         ngx_slab_free(shpool, channel);
         ngx_shmtx_unlock(&data->channels_queue_mutex);
-        ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate memory for new channel id");
+        ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate memory for new channel id (%uz bytes requested, id=\"%V\")", id->len + 1, id);
         return NULL;
     }
 

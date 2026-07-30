@@ -33,6 +33,49 @@ void                   ngx_http_push_stream_delete_channels_data(ngx_http_push_s
 void                   ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force);
 void                   ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force);
 static ngx_inline void ngx_http_push_stream_cleanup_shutting_down_worker_data(ngx_http_push_stream_shm_data_t *data);
+
+/*
+ * DIAGNOSTIC: logs context (requested size + a rough free-space estimate)
+ * whenever a shared-memory slab allocation fails, to help distinguish
+ * genuine exhaustion (everything failing, free pages near zero) from
+ * fragmentation (specific size classes failing while free pages remain).
+ * Call this immediately after any `ngx_slab_alloc(shpool, size) == NULL`.
+ * `where` should be a short static string identifying the call site.
+ */
+static void
+ngx_http_push_stream_log_slab_alloc_failure(ngx_slab_pool_t *shpool, size_t requested_size, const char *where)
+{
+    ngx_slab_page_t *page;
+    ngx_uint_t       free_pages = 0;
+    size_t           total_size = 0;
+    size_t           pagesize   = ngx_pagesize;
+
+    /* rough free-page count: walk the free page list under the slab mutex.
+       This is O(free pages) but only runs on the (rare, critical) failure path. */
+    ngx_shmtx_lock(&shpool->mutex);
+    total_size = (size_t) (shpool->end - shpool->start);
+    for (page = shpool->free.next; page != &shpool->free; page = page->next) {
+        free_pages++;
+        /* safety cap: shared memory could theoretically be corrupted (e.g. after
+           a previous crash mid-allocation) - never walk more "pages" than could
+           possibly fit in the zone, to avoid an infinite loop here too. */
+        if (free_pages > (total_size / pagesize) + 1) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                "push stream module: free page list looks corrupted "
+                "(walked more pages than fit in zone) - aborting walk");
+            break;
+        }
+    }
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    ngx_log_error(NGX_LOG_CRIT, ngx_cycle->log, 0,
+        "push stream module: slab alloc failed at [%s], requested %uz bytes; "
+        "zone total=%uzM, free_pages~=%ui (%uzM), pagesize=%uz",
+        where, requested_size,
+        total_size / (1024 * 1024),
+        free_pages, (free_pages * pagesize) / (1024 * 1024),
+        pagesize);
+}
 static void            ngx_http_push_stream_flush_pending_output(ngx_http_request_t *r);
 
 
@@ -277,6 +320,7 @@ ngx_http_push_stream_apply_text_template(ngx_str_t **dst_value, ngx_str_t **dst_
 {
     if (text != NULL) {
         if ((*dst_value = ngx_slab_alloc(shpool, sizeof(ngx_str_t) + text->len + 1)) == NULL) {
+            ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_str_t) + text->len + 1, "apply_text_template:dst_value");
             return NGX_ERROR;
         }
 
@@ -291,6 +335,7 @@ ngx_http_push_stream_apply_text_template(ngx_str_t **dst_value, ngx_str_t **dst_
         }
 
         if (((*dst_message) = ngx_slab_alloc(shpool, sizeof(ngx_str_t) + aux->len)) == NULL) {
+            ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_str_t) + aux->len, "apply_text_template:dst_message");
             return NGX_ERROR;
         }
 
@@ -385,6 +430,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     int                                        i = 0;
 
     if ((msg = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_msg_t))) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_msg_t), "convert_char_to_msg:msg_struct");
         return NULL;
     }
 
@@ -404,6 +450,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     ngx_queue_init(&msg->queue);
 
     if ((msg->raw.data = ngx_slab_alloc(shpool, len + 1)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, len + 1, "convert_char_to_msg:raw_data");
         ngx_http_push_stream_free_message_memory(shpool, msg);
         return NULL;
     }
@@ -425,6 +472,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     }
 
     if ((msg->formatted_messages = ngx_slab_alloc(shpool, sizeof(ngx_str_t) * msg->qtd_templates)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_str_t) * msg->qtd_templates, "convert_char_to_msg:formatted_messages_array");
         ngx_http_push_stream_free_message_memory(shpool, msg);
         return NULL;
     }
@@ -432,6 +480,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
 
 #if (NGX_HAVE_ZLIB)
     if ((msg->compressed_messages = ngx_slab_alloc(shpool, sizeof(ngx_str_t) * msg->qtd_templates)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_str_t) * msg->qtd_templates, "convert_char_to_msg:compressed_messages_array");
         ngx_http_push_stream_free_message_memory(shpool, msg);
         return NULL;
     }
@@ -477,6 +526,9 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
 
         ngx_str_t *formmated = (msg->formatted_messages + i);
         if ((text == NULL) || ((formmated->data = ngx_slab_alloc(shpool, text->len)) == NULL)) {
+            if (text != NULL) {
+                ngx_http_push_stream_log_slab_alloc_failure(shpool, text->len, "convert_char_to_msg:formatted_message_data");
+            }
             ngx_http_push_stream_free_message_memory(shpool, msg);
             return NULL;
         }
@@ -494,6 +546,11 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
                 if ((comp_slot->data = ngx_slab_alloc(shpool, compressed->len)) != NULL) {
                     comp_slot->len = compressed->len;
                     ngx_memcpy(comp_slot->data, compressed->data, comp_slot->len);
+                } else {
+                    ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                        "push stream module: slab alloc failed for compressed frame "
+                        "(%uz bytes) - falling back to uncompressed for this message",
+                        compressed->len);
                 }
                 /* if slab_alloc failed for compressed we just leave slot zeroed -
                    get_formatted_message will fall back to the plain frame */
