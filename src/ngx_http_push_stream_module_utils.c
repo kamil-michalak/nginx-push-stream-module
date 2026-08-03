@@ -34,6 +34,13 @@ void                   ngx_http_push_stream_collect_expired_messages_and_empty_c
 void                   ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force);
 static ngx_inline void ngx_http_push_stream_cleanup_shutting_down_worker_data(ngx_http_push_stream_shm_data_t *data);
 
+/* forward declaration needed by the chunk-sending helper below (placed near
+   the top of the file, next to the other allocation helpers) - get_buf and
+   send_response_text are already declared via ngx_http_push_stream_module_utils.h,
+   but output_filter is only defined later in this same file with no header
+   declaration, so it needs an explicit forward declaration here. */
+ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r, ngx_chain_t *in);
+
 /*
  * DIAGNOSTIC: logs context (requested size + a rough free-space estimate)
  * whenever a shared-memory slab allocation fails, to help distinguish
@@ -122,6 +129,173 @@ ngx_http_push_stream_round_to_bucket(size_t size)
        (round up to the next 4KB page boundary to still gain some
        consolidation for big payloads) */
     return ((size + 4095) / 4096) * 4096;
+}
+
+/*
+ * Allocates content in shared memory, choosing representation based on size:
+ *   - small (< NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD): single bucketed
+ *     allocation into *out_direct (*out_chunks left NULL)
+ *   - large (>= threshold): a chain of fixed NGX_HTTP_PUSH_STREAM_CHUNK_SIZE
+ *     chunks into *out_chunks (out_direct->data left NULL, but
+ *     out_direct->len is still set to the TOTAL content length, so callers
+ *     can always read the length from out_direct->len regardless of which
+ *     representation was used)
+ *
+ * Self-locking (uses ngx_slab_alloc, not the _locked variant) - matches the
+ * existing convention in ngx_http_push_stream_convert_char_to_msg_on_shared,
+ * where this is called from.
+ *
+ * On allocation failure partway through a chunk chain, all chunks allocated
+ * so far in THIS call are freed before returning NGX_ERROR (no partial leak
+ * for this specific content item; the caller is still responsible for
+ * cleaning up any OTHER already-allocated fields on the owning msg via the
+ * normal ngx_http_push_stream_free_message_memory error path).
+ */
+static ngx_int_t
+ngx_http_push_stream_alloc_content(ngx_slab_pool_t *shpool, u_char *data, size_t len,
+    ngx_str_t *out_direct, ngx_http_push_stream_chunk_t **out_chunks, const char *diag_where)
+{
+    ngx_http_push_stream_chunk_t *head = NULL;
+    ngx_http_push_stream_chunk_t *tail = NULL;
+    ngx_http_push_stream_chunk_t *chunk;
+    size_t                         remaining;
+    u_char                        *src;
+
+    out_direct->data = NULL;
+    out_direct->len  = len;
+    *out_chunks = NULL;
+
+    if (len < NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD) {
+        size_t alloc_size = ngx_http_push_stream_round_to_bucket(len);
+        out_direct->data = ngx_slab_alloc(shpool, alloc_size);
+        if (out_direct->data == NULL) {
+            ngx_http_push_stream_log_slab_alloc_failure(shpool, alloc_size, diag_where);
+            return NGX_ERROR;
+        }
+        ngx_memcpy(out_direct->data, data, len);
+        return NGX_OK;
+    }
+
+    /* large content: build a chunk chain, one page-sized piece at a time.
+       Each chunk only ever needs a SINGLE free page to satisfy - unlike one
+       big allocation, which needs `len / CHUNK_SIZE` CONTIGUOUS free pages,
+       a requirement that gets steadily harder to satisfy as shared memory
+       fragments under sustained churn even when plenty of free space
+       remains in aggregate. */
+    remaining = len;
+    src = data;
+
+    while (remaining > 0) {
+        chunk = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_chunk_t));
+        if (chunk == NULL) {
+            ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_chunk_t), diag_where);
+            while (head != NULL) {
+                ngx_http_push_stream_chunk_t *next = head->next;
+                ngx_slab_free(shpool, head);
+                head = next;
+            }
+            return NGX_ERROR;
+        }
+
+        chunk->next = NULL;
+        chunk->len  = (remaining > NGX_HTTP_PUSH_STREAM_CHUNK_SIZE) ? NGX_HTTP_PUSH_STREAM_CHUNK_SIZE : remaining;
+        ngx_memcpy(chunk->data, src, chunk->len);
+
+        src       += chunk->len;
+        remaining -= chunk->len;
+
+        if (head == NULL) {
+            head = chunk;
+        } else {
+            tail->next = chunk;
+        }
+        tail = chunk;
+    }
+
+    *out_chunks = head;
+    return NGX_OK;
+}
+
+/*
+ * Frees content allocated by ngx_http_push_stream_alloc_content(), either
+ * representation. Caller-locked (uses ngx_slab_free_locked, NOT
+ * self-locking) - matches ngx_http_push_stream_free_message_memory's
+ * existing convention of wrapping its whole body in a single
+ * ngx_shmtx_lock/unlock pair; this is only ever called from within that
+ * already-locked section.
+ */
+static void
+ngx_http_push_stream_free_content_locked(ngx_slab_pool_t *shpool, ngx_str_t *direct, ngx_http_push_stream_chunk_t *chunks)
+{
+    ngx_http_push_stream_chunk_t *next;
+
+    if (direct != NULL && direct->data != NULL) {
+        ngx_slab_free_locked(shpool, direct->data);
+        return;
+    }
+
+    while (chunks != NULL) {
+        next = chunks->next;
+        ngx_slab_free_locked(shpool, chunks);
+        chunks = next;
+    }
+}
+
+/*
+ * Sends content previously stored via ngx_http_push_stream_alloc_content()
+ * to the client, in a SINGLE ngx_http_output_filter() call regardless of
+ * whether it's stored as one direct buffer or a multi-chunk chain - each
+ * chunk becomes one link in an ngx_chain_t, all submitted together (no
+ * copying: buffers point directly at the shared-memory chunk data, same
+ * zero-copy approach as the existing single-buffer send path).
+ */
+static ngx_int_t
+ngx_http_push_stream_send_content(ngx_http_request_t *r, ngx_str_t *direct, ngx_http_push_stream_chunk_t *chunks, ngx_flag_t last_buffer)
+{
+    ngx_chain_t                   *out = NULL, *cur, *prev = NULL;
+    ngx_buf_t                     *b;
+    ngx_http_push_stream_chunk_t  *chunk;
+
+    if (r->connection->error) {
+        return NGX_ERROR;
+    }
+
+    if (direct != NULL && direct->data != NULL) {
+        return ngx_http_push_stream_send_response_text(r, direct->data, direct->len, last_buffer);
+    }
+
+    if (chunks == NULL) {
+        return NGX_ERROR;
+    }
+
+    for (chunk = chunks; chunk != NULL; chunk = chunk->next) {
+        cur = ngx_http_push_stream_get_buf(r);
+        if (cur == NULL) {
+            return NGX_ERROR;
+        }
+
+        b = cur->buf;
+        b->memory        = 1;
+        b->temporary      = 0;
+        b->flush          = (chunk->next == NULL);
+        b->last_in_chain  = (chunk->next == NULL);
+        b->last_buf       = (chunk->next == NULL) ? last_buffer : 0;
+        b->pos            = chunk->data;
+        b->start          = b->pos;
+        b->last           = b->pos + chunk->len;
+        b->end            = b->last;
+
+        cur->next = NULL;
+
+        if (out == NULL) {
+            out = cur;
+        } else {
+            prev->next = cur;
+        }
+        prev = cur;
+    }
+
+    return ngx_http_push_stream_output_filter(r, out);
 }
 
 static void            ngx_http_push_stream_flush_pending_output(ngx_http_request_t *r);
@@ -490,6 +664,8 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->event_type_message = NULL;
     msg->formatted_messages = NULL;
     msg->compressed_messages = NULL;
+    msg->formatted_chunks = NULL;
+    msg->compressed_chunks = NULL;
     msg->deleted = 0;
     msg->expires = 0;
     msg->id = id;
@@ -529,6 +705,13 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     }
     ngx_memzero(msg->formatted_messages, sizeof(ngx_str_t) * msg->qtd_templates);
 
+    if ((msg->formatted_chunks = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates, "convert_char_to_msg:formatted_chunks_array");
+        ngx_http_push_stream_free_message_memory(shpool, msg);
+        return NULL;
+    }
+    ngx_memzero(msg->formatted_chunks, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates);
+
 #if (NGX_HAVE_ZLIB)
     if ((msg->compressed_messages = ngx_slab_alloc(shpool, sizeof(ngx_str_t) * msg->qtd_templates)) == NULL) {
         ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_str_t) * msg->qtd_templates, "convert_char_to_msg:compressed_messages_array");
@@ -536,6 +719,13 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
         return NULL;
     }
     ngx_memzero(msg->compressed_messages, sizeof(ngx_str_t) * msg->qtd_templates);
+
+    if ((msg->compressed_chunks = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates, "convert_char_to_msg:compressed_chunks_array");
+        ngx_http_push_stream_free_message_memory(shpool, msg);
+        return NULL;
+    }
+    ngx_memzero(msg->compressed_chunks, sizeof(ngx_http_push_stream_chunk_t *) * msg->qtd_templates);
 #endif
 
     for (q = ngx_queue_head(&mcf->msg_templates); q != ngx_queue_sentinel(&mcf->msg_templates); q = ngx_queue_next(q)) {
@@ -576,17 +766,16 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
         }
 
         ngx_str_t *formmated = (msg->formatted_messages + i);
-        size_t formatted_alloc_size = (text != NULL) ? ngx_http_push_stream_round_to_bucket(text->len) : 0;
-        if ((text == NULL) || ((formmated->data = ngx_slab_alloc(shpool, formatted_alloc_size)) == NULL)) {
-            if (text != NULL) {
-                ngx_http_push_stream_log_slab_alloc_failure(shpool, formatted_alloc_size, "convert_char_to_msg:formatted_message_data");
-            }
+        if (text == NULL) {
             ngx_http_push_stream_free_message_memory(shpool, msg);
             return NULL;
         }
-
-        formmated->len = text->len;
-        ngx_memcpy(formmated->data, text->data, formmated->len);
+        if (ngx_http_push_stream_alloc_content(shpool, text->data, text->len,
+                formmated, &msg->formatted_chunks[i],
+                "convert_char_to_msg:formatted_message_data") != NGX_OK) {
+            ngx_http_push_stream_free_message_memory(shpool, msg);
+            return NULL;
+        }
 
 #if (NGX_HAVE_ZLIB)
         /* for websocket templates, also try to build a compressed frame */
@@ -595,18 +784,16 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
                 aux->data, aux->len, temp_pool);
             if (compressed != NULL) {
                 ngx_str_t *comp_slot = (msg->compressed_messages + i);
-                size_t compressed_alloc_size = ngx_http_push_stream_round_to_bucket(compressed->len);
-                if ((comp_slot->data = ngx_slab_alloc(shpool, compressed_alloc_size)) != NULL) {
-                    comp_slot->len = compressed->len;
-                    ngx_memcpy(comp_slot->data, compressed->data, comp_slot->len);
-                } else {
+                if (ngx_http_push_stream_alloc_content(shpool, compressed->data, compressed->len,
+                        comp_slot, &msg->compressed_chunks[i],
+                        "convert_char_to_msg:compressed_message_data") != NGX_OK) {
                     ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
                         "push stream module: slab alloc failed for compressed frame "
-                        "(%uz bytes, bucketed to %uz) - falling back to uncompressed for this message",
-                        compressed->len, compressed_alloc_size);
+                        "(%uz bytes) - falling back to uncompressed for this message",
+                        compressed->len);
+                    /* leave comp_slot/compressed_chunks[i] zeroed - get_formatted_message
+                       will fall back to the plain frame */
                 }
-                /* if slab_alloc failed for compressed we just leave slot zeroed -
-                   get_formatted_message will fall back to the plain frame */
             }
         }
 #endif
@@ -842,7 +1029,8 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
     }
 
     if (rc == NGX_OK) {
-        ngx_str_t *str = ngx_http_push_stream_get_formatted_message(r, channel, msg);
+        ngx_http_push_stream_chunk_t *str_chunks = NULL;
+        ngx_str_t *str = ngx_http_push_stream_get_formatted_message(r, channel, msg, &str_chunks);
         if (str != NULL) {
             if ((rc == NGX_OK) && use_jsonp && send_callback) {
                 rc = ngx_http_push_stream_send_response_text(r, ctx->callback->data, ctx->callback->len, 0);
@@ -870,7 +1058,7 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
             }
 
             if (rc == NGX_OK) {
-                rc = ngx_http_push_stream_send_response_text(r, str->data, str->len, 0);
+                rc = ngx_http_push_stream_send_content(r, str, str_chunks, 0);
                 if (rc == NGX_OK) {
                     ctx->message_sent  = 1;
                     ctx->last_msg_sent = ngx_current_msec;
@@ -1564,23 +1752,31 @@ ngx_http_push_stream_free_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_
     if (msg->formatted_messages != NULL) {
         for (i = 0; i < msg->qtd_templates; i++) {
             ngx_str_t *formmated = (msg->formatted_messages + i);
-            if ((formmated != NULL) && (formmated->data != NULL)) {
-                ngx_slab_free_locked(shpool, formmated->data);
+            ngx_http_push_stream_chunk_t *chunks = (msg->formatted_chunks != NULL) ? msg->formatted_chunks[i] : NULL;
+            if ((formmated != NULL) && ((formmated->data != NULL) || (chunks != NULL))) {
+                ngx_http_push_stream_free_content_locked(shpool, formmated, chunks);
             }
         }
 
         ngx_slab_free_locked(shpool, msg->formatted_messages);
+    }
+    if (msg->formatted_chunks != NULL) {
+        ngx_slab_free_locked(shpool, msg->formatted_chunks);
     }
 
 #if (NGX_HAVE_ZLIB)
     if (msg->compressed_messages != NULL) {
         for (i = 0; i < msg->qtd_templates; i++) {
             ngx_str_t *comp = (msg->compressed_messages + i);
-            if ((comp != NULL) && (comp->data != NULL)) {
-                ngx_slab_free_locked(shpool, comp->data);
+            ngx_http_push_stream_chunk_t *chunks = (msg->compressed_chunks != NULL) ? msg->compressed_chunks[i] : NULL;
+            if ((comp != NULL) && ((comp->data != NULL) || (chunks != NULL))) {
+                ngx_http_push_stream_free_content_locked(shpool, comp, chunks);
             }
         }
         ngx_slab_free_locked(shpool, msg->compressed_messages);
+    }
+    if (msg->compressed_chunks != NULL) {
+        ngx_slab_free_locked(shpool, msg->compressed_chunks);
     }
 #endif
 
@@ -1770,10 +1966,12 @@ ngx_http_push_stream_str_replace(const ngx_str_t *org, const ngx_str_t *find, co
 
 
 static ngx_str_t *
-ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *message)
+ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *message, ngx_http_push_stream_chunk_t **out_chunks)
 {
     ngx_http_push_stream_loc_conf_t        *pslcf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_module_ctx_t      *ctx   = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+
+    *out_chunks = NULL;
 
     if (pslcf->message_template_index > 0) {
         /* after reload the template count may differ from when the message was created;
@@ -1781,17 +1979,21 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
         if ((ngx_uint_t) pslcf->message_template_index > message->qtd_templates) {
             return &message->raw;
         }
+        ngx_uint_t idx = pslcf->message_template_index - 1;
 #if (NGX_HAVE_ZLIB)
         if (ctx != NULL && ctx->deflate_enabled && message->compressed_messages != NULL) {
-            ngx_str_t *comp = message->compressed_messages + pslcf->message_template_index - 1;
-            if (comp->data != NULL && comp->len > 0) {
+            ngx_str_t *comp = message->compressed_messages + idx;
+            ngx_http_push_stream_chunk_t *comp_chunks = (message->compressed_chunks != NULL) ? message->compressed_chunks[idx] : NULL;
+            if ((comp->data != NULL || comp_chunks != NULL) && comp->len > 0) {
+                *out_chunks = comp_chunks;
                 return comp;
             }
             /* compressed slot empty (payload too small or compression unhelpful)
                - fall through to plain frame */
         }
 #endif
-        return message->formatted_messages + pslcf->message_template_index - 1;
+        *out_chunks = (message->formatted_chunks != NULL) ? message->formatted_chunks[idx] : NULL;
+        return message->formatted_messages + idx;
     }
     return &message->raw;
 }

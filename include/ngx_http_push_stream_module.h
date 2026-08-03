@@ -88,6 +88,37 @@ typedef struct ngx_http_push_stream_shm_data_s ngx_http_push_stream_shm_data_t;
 typedef struct ngx_http_push_stream_global_shm_data_s ngx_http_push_stream_global_shm_data_t;
 typedef struct ngx_http_push_stream_channel_s ngx_http_push_stream_channel_t;
 
+/*
+ * Fixed-size chunk for storing large (formatted/compressed) message content
+ * in shared memory as a LINKED LIST of small pages instead of one big
+ * contiguous block.
+ *
+ * Why: nginx's slab allocator needs a CONTIGUOUS run of pages for any single
+ * allocation. Under sustained high-churn traffic (many small messages
+ * allocated/freed constantly), free shared memory becomes fragmented into
+ * many small non-contiguous gaps - even with hundreds of MB free overall,
+ * a single large message (e.g. ~800KB = ~196 pages) can fail to allocate
+ * because no run of 196 CONTIGUOUS free pages exists, even though the total
+ * free space is far more than enough (ngx_slab_alloc() failed: no memory).
+ *
+ * Each chunk is exactly one page (NGX_HTTP_PUSH_STREAM_CHUNK_SIZE), so it
+ * only ever needs a SINGLE free page to satisfy - the most commonly
+ * available unit of free space, regardless of fragmentation elsewhere.
+ * Only large content uses this representation; see
+ * NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD - smaller content keeps using a
+ * single ngx_str_t allocation (via ngx_http_push_stream_round_to_bucket) for
+ * simplicity and to avoid linked-list overhead for the common case.
+ */
+#define NGX_HTTP_PUSH_STREAM_CHUNK_SIZE       4096
+#define NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD  16384
+
+typedef struct ngx_http_push_stream_chunk_s ngx_http_push_stream_chunk_t;
+struct ngx_http_push_stream_chunk_s {
+    ngx_http_push_stream_chunk_t   *next;
+    size_t                          len;   /* bytes used in this chunk (== CHUNK_SIZE except possibly the last one) */
+    u_char                          data[NGX_HTTP_PUSH_STREAM_CHUNK_SIZE];
+};
+
 typedef struct {
     ngx_flag_t                      enabled;
     ngx_str_t                       channel_deleted_message_text;
@@ -170,6 +201,19 @@ struct ngx_http_push_stream_msg_s {
     ngx_str_t                      *event_type_message;
     ngx_str_t                      *formatted_messages;
     ngx_str_t                      *compressed_messages;  /* deflated WS frames, NULL per slot if not worth compressing */
+    /*
+     * Parallel arrays to formatted_messages/compressed_messages (same index,
+     * same qtd_templates length). For a given template index i:
+     *   - formatted_messages[i].data != NULL  => small message, stored directly
+     *   - formatted_messages[i].data == NULL && formatted_chunks[i] != NULL
+     *                                          => large message, stored as a
+     *                                             chunk chain; formatted_messages[i].len
+     *                                             still holds the TOTAL length
+     *   - both NULL                           => absent (as before chunking existed)
+     * Same convention for compressed_messages / compressed_chunks.
+     */
+    ngx_http_push_stream_chunk_t  **formatted_chunks;
+    ngx_http_push_stream_chunk_t  **compressed_chunks;
     ngx_int_t                       workers_ref_count;
     ngx_uint_t                      qtd_templates;
 };
