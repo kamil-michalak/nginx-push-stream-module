@@ -652,6 +652,12 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     ngx_queue_t                               *q;
     ngx_http_push_stream_msg_t                *msg;
     int                                        i = 0;
+    /* Wraps the ORIGINAL caller-supplied buffer (not yet in shared memory,
+       always contiguous - regular pool memory). Used for template
+       substitution below instead of msg->raw, since msg->raw may end up
+       chunked (non-contiguous) for large content. See the comment on
+       msg->raw_chunks in the header for the full rationale. */
+    ngx_str_t original_data = { len, data };
 
     if ((msg = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_msg_t))) == NULL) {
         ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_msg_t), "convert_char_to_msg:msg_struct");
@@ -666,6 +672,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->compressed_messages = NULL;
     msg->formatted_chunks = NULL;
     msg->compressed_chunks = NULL;
+    msg->raw_chunks = NULL;
     msg->deleted = 0;
     msg->expires = 0;
     msg->id = id;
@@ -675,17 +682,17 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->qtd_templates = mcf->qtd_templates;
     ngx_queue_init(&msg->queue);
 
-    size_t raw_alloc_size = ngx_http_push_stream_round_to_bucket(len + 1);
-    if ((msg->raw.data = ngx_slab_alloc(shpool, raw_alloc_size)) == NULL) {
-        ngx_http_push_stream_log_slab_alloc_failure(shpool, raw_alloc_size, "convert_char_to_msg:raw_data");
+    if (ngx_http_push_stream_alloc_content(shpool, data, len,
+            &msg->raw, &msg->raw_chunks,
+            "convert_char_to_msg:raw_data") != NGX_OK) {
         ngx_http_push_stream_free_message_memory(shpool, msg);
         return NULL;
     }
-
-    msg->raw.len = len;
-    // copy the message to shared memory
-    ngx_memcpy(msg->raw.data, data, len);
-    msg->raw.data[msg->raw.len] = '\0';
+    /* Note: unlike the original single-allocation code, raw.data is no
+       longer null-terminated (alloc_content only reserves exactly `len`
+       bytes, rounded up to a bucket - not len+1). Verified no consumer in
+       this codebase relies on null-termination of msg->raw.data; every
+       reader uses the ngx_str_t (length-bounded) interface. */
 
 
     if (ngx_http_push_stream_apply_text_template(&msg->event_id, &msg->event_id_message, event_id, &NGX_HTTP_PUSH_STREAM_EVENTSOURCE_ID_TEMPLATE, &NGX_HTTP_PUSH_STREAM_TOKEN_MESSAGE_EVENT_ID, shpool, temp_pool) != NGX_OK) {
@@ -735,7 +742,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
             ngx_http_push_stream_line_t     *cur_line;
             ngx_queue_t                     *lines, *q_line;
 
-            if ((lines = ngx_http_push_stream_split_by_crlf(&msg->raw, temp_pool)) == NULL) {
+            if ((lines = ngx_http_push_stream_split_by_crlf(&original_data, temp_pool)) == NULL) {
                 ngx_http_push_stream_free_message_memory(shpool, msg);
                 return NULL;
             }
@@ -752,7 +759,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
                 ngx_sprintf(aux->data, "%V\n", tmp);
             }
         } else {
-            aux = ngx_http_push_stream_format_message(channel, msg, &msg->raw, cur, temp_pool);
+            aux = ngx_http_push_stream_format_message(channel, msg, &original_data, cur, temp_pool);
         }
 
         if (aux == NULL) {
@@ -1780,7 +1787,9 @@ ngx_http_push_stream_free_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_
     }
 #endif
 
-    if (msg->raw.data != NULL) ngx_slab_free_locked(shpool, msg->raw.data);
+    if ((msg->raw.data != NULL) || (msg->raw_chunks != NULL)) {
+        ngx_http_push_stream_free_content_locked(shpool, &msg->raw, msg->raw_chunks);
+    }
     if (msg->event_id != NULL) ngx_slab_free_locked(shpool, msg->event_id);
     if (msg->event_type != NULL) ngx_slab_free_locked(shpool, msg->event_type);
     if (msg->event_id_message != NULL) ngx_slab_free_locked(shpool, msg->event_id_message);
@@ -1977,6 +1986,7 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
         /* after reload the template count may differ from when the message was created;
            fall back to raw to avoid out-of-bounds access on formatted_messages */
         if ((ngx_uint_t) pslcf->message_template_index > message->qtd_templates) {
+            *out_chunks = message->raw_chunks;
             return &message->raw;
         }
         ngx_uint_t idx = pslcf->message_template_index - 1;
@@ -1995,6 +2005,7 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
         *out_chunks = (message->formatted_chunks != NULL) ? message->formatted_chunks[idx] : NULL;
         return message->formatted_messages + idx;
     }
+    *out_chunks = message->raw_chunks;
     return &message->raw;
 }
 

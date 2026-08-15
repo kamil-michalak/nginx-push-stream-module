@@ -194,6 +194,19 @@ struct ngx_http_push_stream_msg_s {
     ngx_flag_t                      deleted;
     ngx_int_t                       id;
     ngx_str_t                       raw;
+    /* Same "small vs chunked" convention as formatted_chunks/compressed_chunks
+       below, but a single pointer (not an array) since there is only one
+       raw content per message, not one per template. raw.data == NULL &&
+       raw_chunks != NULL means chunked; raw.len holds the TOTAL length either
+       way. Note: template substitution (ngx_http_push_stream_format_message
+       et al, called during message creation) never reads from raw/raw_chunks
+       directly - it reads from the ORIGINAL caller-supplied data/len buffer
+       instead, which is always contiguous (regular pool memory, not shared
+       memory, so never subject to slab fragmentation). raw/raw_chunks exists
+       purely as a shared-memory COPY for later retrieval - e.g. the
+       "no message_template configured" fallback in get_formatted_message(),
+       which can send raw directly to a subscriber. */
+    ngx_http_push_stream_chunk_t   *raw_chunks;
     ngx_int_t                       tag;
     ngx_str_t                      *event_id;
     ngx_str_t                      *event_type;
