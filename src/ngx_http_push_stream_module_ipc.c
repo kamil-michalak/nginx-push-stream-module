@@ -37,6 +37,18 @@ void ngx_http_push_stream_ipc_init_worker_data(ngx_http_push_stream_shm_data_t *
 static ngx_inline void ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_data_t *data);
 static ngx_inline void ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t *data);
 
+/*
+ * ngx_http_push_stream_socketpairs (below) is a plain BSS global, zero-
+ * initialized by the C runtime, i.e. {0,0} for every slot at process start -
+ * NOT {NGX_INVALID_FILE, NGX_INVALID_FILE}. Slot 0/0 would look like "fd 0
+ * (stdin) held open" if compared against NGX_INVALID_FILE naively. This
+ * flag lets ngx_http_push_stream_init_ipc() tell "first run this process"
+ * (nothing to close yet) apart from "reload" (may hold fds from the
+ * previous generation that must be closed before being overwritten) without
+ * depending on the array's initial contents.
+ */
+static ngx_flag_t ngx_http_push_stream_ipc_initialized = 0;
+
 
 static ngx_int_t
 ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
@@ -64,6 +76,21 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
 
         // copypaste from os/unix/ngx_process.c (ngx_spawn_process)
         ngx_socket_t    *socks = ngx_http_push_stream_socketpairs[s];
+
+        /* On "nginx -s reload" this function runs again, in the same master
+           process, for the same NGX_MAX_PROCESSES-sized static array - while
+           the previous generation's workers may still be running and using
+           the socketpair fds currently sitting in this slot. socketpair()
+           below overwrites socks[0]/socks[1] with two brand new fds; without
+           closing the old ones first here, they're simply forgotten (never
+           closed by anyone), leaking 2 file descriptors per worker slot on
+           every reload until the process eventually hits its fd limit. */
+        if (ngx_http_push_stream_ipc_initialized) {
+            ngx_close_channel(socks, cycle->log);
+            socks[0] = NGX_INVALID_FILE;
+            socks[1] = NGX_INVALID_FILE;
+        }
+
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks) == -1) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno, "socketpair() failed on socketpair while initializing push stream module");
             return NGX_ERROR;
@@ -101,6 +128,8 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
 
         s++; // NEXT!!
     }
+
+    ngx_http_push_stream_ipc_initialized = 1;
 
     return NGX_OK;
 }

@@ -87,6 +87,7 @@ typedef struct ngx_http_push_stream_msg_s ngx_http_push_stream_msg_t;
 typedef struct ngx_http_push_stream_shm_data_s ngx_http_push_stream_shm_data_t;
 typedef struct ngx_http_push_stream_global_shm_data_s ngx_http_push_stream_global_shm_data_t;
 typedef struct ngx_http_push_stream_channel_s ngx_http_push_stream_channel_t;
+typedef struct ngx_http_push_stream_shared_ping_msg_s ngx_http_push_stream_shared_ping_msg_t;
 
 /*
  * Fixed-size chunk for storing large (formatted/compressed) message content
@@ -167,7 +168,10 @@ typedef struct {
     ngx_array_t                     *websocket_extra_headers;  /* array of ngx_http_push_stream_extra_header_t */
     ngx_uint_t                      ping_mode;
     ngx_str_t                       ping_message_text;
-    ngx_http_push_stream_msg_t     *ping_msg;  /* cached slab msg built from ping_message_text, per location */
+    ngx_http_push_stream_msg_t     *ping_msg;  /* fast per-cycle cache of the shared entry below; reset to NULL on
+                                                   every reload (fresh loc_conf) and re-fetched (not rebuilt) from
+                                                   ngx_http_push_stream_shm_data_t.ping_msgs_queue on first use - see
+                                                   ngx_http_push_stream_get_shared_ping_msg() */
     ngx_flag_t                      websocket_allow_resubscribe;
     ngx_uint_t                      websocket_max_channels_per_connection;
     ngx_uint_t                      unknown_event_id_behavior;
@@ -229,6 +233,35 @@ struct ngx_http_push_stream_msg_s {
     ngx_http_push_stream_chunk_t  **compressed_chunks;
     ngx_int_t                       workers_ref_count;
     ngx_uint_t                      qtd_templates;
+};
+
+/*
+ * Content-addressed cache entry for "native" streaming ping messages,
+ * stored in ngx_http_push_stream_shm_data_t.ping_msgs_queue (shared memory).
+ *
+ * Ping messages used to be built lazily straight into
+ * ngx_http_push_stream_loc_conf_t.ping_msg (shared memory), which is fine
+ * within one config generation, but loc_conf is recreated from scratch on
+ * every "nginx -s reload" (see ngx_http_push_stream_create_loc_conf, which
+ * always starts ping_msg back at NULL) while the shared-memory message it
+ * used to point to was never freed nor carried forward - so every reload of
+ * a location using push_stream_ping_message_interval leaked one shared
+ * message (see memory-leak-audit-test17.md finding #2).
+ *
+ * This entry type lets ngx_http_push_stream_get_shared_ping_msg() dedupe by
+ * ping text instead: the queue itself lives in ngx_http_push_stream_shm_data_t,
+ * which is NOT recreated on reload (ngx_http_push_stream_init_shm_zone reuses
+ * the existing shared struct via its "zone already initialized" branch), so
+ * entries - and the ngx_http_push_stream_msg_t they point to - are naturally
+ * carried forward across reloads for free, with no per-reload transfer code
+ * needed. A new entry is only ever added, never removed: if ping text is
+ * changed and later reloaded back to a previous value, the old entry is
+ * still there and gets reused rather than leaking a duplicate.
+ */
+struct ngx_http_push_stream_shared_ping_msg_s {
+    ngx_queue_t                      queue;
+    ngx_str_t                        text;  /* copy of ping_message_text, lives in shared memory */
+    ngx_http_push_stream_msg_t      *msg;
 };
 
 typedef struct ngx_http_push_stream_subscriber_s ngx_http_push_stream_subscriber_t;
@@ -390,6 +423,10 @@ struct ngx_http_push_stream_shm_data_s {
     ngx_shmtx_t                             events_channel_mutex;
     ngx_shmtx_sh_t                          events_channel_lock;
     ngx_http_push_stream_channel_t         *events_channel;
+    ngx_queue_t                             ping_msgs_queue;     /* queue of ngx_http_push_stream_shared_ping_msg_t,
+                                                                     survives reload - see comment on that struct */
+    ngx_shmtx_t                             ping_msgs_mutex;
+    ngx_shmtx_sh_t                          ping_msgs_lock;
 };
 
 ngx_shm_zone_t     *ngx_http_push_stream_global_shm_zone = NULL;

@@ -812,6 +812,83 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
 }
 
 
+/*
+ * Returns the shared-memory ping message for `text`, building and caching
+ * it the first time this exact text is seen and reusing it on every
+ * subsequent call - including across "nginx -s reload" - instead of
+ * rebuilding (and leaking, see the struct comment on
+ * ngx_http_push_stream_shared_ping_msg_s) a fresh one per config generation.
+ *
+ * Safe to call from any worker at any time: the cache lives in
+ * mcf->shm_data->ping_msgs_queue, which is shared memory guarded by its own
+ * mutex, and is never freed/removed - only ever appended to - so a pointer
+ * handed back here stays valid for the lifetime of the shared memory zone,
+ * even if some other worker is still using an entry built under a previous
+ * config generation.
+ *
+ * Known trade-off: an entry is built once (using the message templates in
+ * effect at that time) and then reused for as long as the ping text stays
+ * the same, even across reloads that change push_stream_message_template.
+ * ngx_http_push_stream_get_formatted_message() already falls back to
+ * ->raw for a template index beyond a message's qtd_templates (see the
+ * reload_memory_leak fix), so this is a stale-formatting edge case, not a
+ * safety issue - deliberately accepted to avoid ever needing to free an
+ * entry a still-running old worker might be using concurrently.
+ */
+ngx_http_push_stream_msg_t *
+ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, ngx_str_t *text, ngx_pool_t *temp_pool)
+{
+    ngx_http_push_stream_shm_data_t           *data = mcf->shm_data;
+    ngx_slab_pool_t                           *shpool = mcf->shpool;
+    ngx_queue_t                               *q;
+    ngx_http_push_stream_shared_ping_msg_t    *entry;
+    ngx_http_push_stream_msg_t                *msg = NULL;
+
+    ngx_shmtx_lock(&data->ping_msgs_mutex);
+
+    for (q = ngx_queue_head(&data->ping_msgs_queue); q != ngx_queue_sentinel(&data->ping_msgs_queue); q = ngx_queue_next(q)) {
+        entry = ngx_queue_data(q, ngx_http_push_stream_shared_ping_msg_t, queue);
+        if ((entry->text.len == text->len) && (ngx_memcmp(entry->text.data, text->data, text->len) == 0)) {
+            ngx_shmtx_unlock(&data->ping_msgs_mutex);
+            return entry->msg;
+        }
+    }
+
+    /* not cached yet - build it and add a new entry, still holding the lock
+       so two workers racing to build the same text can't both succeed and
+       leak one of the two results */
+    if ((msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text->data, text->len, NULL,
+            NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool)) == NULL) {
+        ngx_shmtx_unlock(&data->ping_msgs_mutex);
+        return NULL;
+    }
+
+    if ((entry = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_shared_ping_msg_t))) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_shared_ping_msg_t), "get_shared_ping_msg:entry");
+        ngx_http_push_stream_free_message_memory(shpool, msg);
+        ngx_shmtx_unlock(&data->ping_msgs_mutex);
+        return NULL;
+    }
+
+    if ((entry->text.data = ngx_slab_alloc(shpool, text->len)) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, text->len, "get_shared_ping_msg:text");
+        ngx_slab_free(shpool, entry);
+        ngx_http_push_stream_free_message_memory(shpool, msg);
+        ngx_shmtx_unlock(&data->ping_msgs_mutex);
+        return NULL;
+    }
+    ngx_memcpy(entry->text.data, text->data, text->len);
+    entry->text.len = text->len;
+    entry->msg = msg;
+
+    ngx_queue_insert_tail(&data->ping_msgs_queue, &entry->queue);
+
+    ngx_shmtx_unlock(&data->ping_msgs_mutex);
+
+    return msg;
+}
+
+
 ngx_int_t
 ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_flag_t store_messages, ngx_pool_t *temp_pool)
 {
@@ -1895,10 +1972,14 @@ ngx_http_push_stream_ping_timer_wake_handler(ngx_event_t *ev)
 
         send_ping_msg:
         if (pslcf->ping_msg == NULL) {
-            if ((pslcf->ping_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(
-                    mcf, pslcf->ping_message_text.data, pslcf->ping_message_text.len,
-                    NULL, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID,
-                    NULL, NULL, 0, 0, r->pool)) == NULL) {
+            /* pslcf (loc_conf) is recreated from scratch on every config
+               reload, so this per-process cache is intentionally always
+               empty right after a reload - but the lookup below is a cheap,
+               reload-safe fetch from the shared cache (see
+               ngx_http_push_stream_get_shared_ping_msg), not a rebuild, so
+               it neither leaks nor duplicates work across reloads. */
+            if ((pslcf->ping_msg = ngx_http_push_stream_get_shared_ping_msg(
+                    mcf, &pslcf->ping_message_text, r->pool)) == NULL) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                     "push stream module: unable to allocate ping message in shared memory");
             }

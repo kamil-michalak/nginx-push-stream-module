@@ -428,6 +428,31 @@ ngx_http_push_stream_preconfig(ngx_conf_t *cf)
 static ngx_int_t
 ngx_http_push_stream_postconfig(ngx_conf_t *cf)
 {
+    /*
+     * ngx_http_push_stream_module_paddings_chunks[_for_eventsource] are
+     * process-wide globals (include/ngx_http_push_stream_module.h), but the
+     * memory they point to is allocated from cf->pool below - which is the
+     * CURRENT cycle's pool, freed by nginx shortly after every successful
+     * "nginx -s reload" once the new cycle takes over.
+     *
+     * The old code guarded the allocation with "== NULL", intended to avoid
+     * rebuilding on every call - but nginx only has one http{} block per
+     * config, so this postconfiguration hook runs exactly once per cycle
+     * anyway. The guard's actual effect was to skip rebuilding on RELOAD:
+     * after the first successful config load these globals stayed non-NULL
+     * forever, so from the second reload onward they kept pointing into the
+     * *original* (by then destroyed) cycle's pool - a use-after-free hit by
+     * every response using push_stream_padding_by_user_agent.
+     *
+     * Resetting them here, every time this hook runs, makes the allocation
+     * below always target the current cycle's pool - which is exactly what
+     * "one allocation per cycle" should mean. The old (previous cycle's)
+     * arrays need no explicit freeing: they're already gone together with
+     * the previous cycle's pool.
+     */
+    ngx_http_push_stream_module_paddings_chunks = NULL;
+    ngx_http_push_stream_module_paddings_chunks_for_eventsource = NULL;
+
     if ((ngx_http_push_stream_padding_max_len > 0) && (ngx_http_push_stream_module_paddings_chunks == NULL)) {
         ngx_uint_t steps = ngx_http_push_stream_padding_max_len / 100;
         if ((ngx_http_push_stream_module_paddings_chunks = ngx_pcalloc(cf->pool, sizeof(ngx_str_t) * (steps + 1))) == NULL) {
@@ -1175,7 +1200,11 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 
         /* transfer pre-allocated shared messages from the old mcf to the new one
            so they are reused instead of re-created (and the old ones leaked).
-           Note: ping_msg is now per loc_conf, not mcf - no transfer needed here. */
+           Note: ping messages are handled separately and need no transfer here -
+           they're cached by content in d->ping_msgs_queue (part of `d`, which is
+           the very struct being reused via this reload branch), so they already
+           survive reload automatically. See ngx_http_push_stream_get_shared_ping_msg
+           and the comment on ngx_http_push_stream_shared_ping_msg_s. */
         if (d->mcf != NULL) {
             if (mcf->longpooling_timeout_msg == NULL && d->mcf->longpooling_timeout_msg != NULL) {
                 mcf->longpooling_timeout_msg = d->mcf->longpooling_timeout_msg;
@@ -1234,10 +1263,15 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     ngx_queue_init(&d->channels_queue);
     ngx_queue_init(&d->channels_to_delete);
     ngx_queue_init(&d->channels_trash);
+    ngx_queue_init(&d->ping_msgs_queue);
 
     ngx_queue_insert_tail(&global_shm_data->shm_datas_queue, &d->shm_data_queue);
 
     if (ngx_http_push_stream_create_shmtx(&d->messages_trash_mutex, &d->messages_trash_lock, (u_char *) "push_stream_messages_trash") != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_push_stream_create_shmtx(&d->ping_msgs_mutex, &d->ping_msgs_lock, (u_char *) "push_stream_ping_msgs") != NGX_OK) {
         return NGX_ERROR;
     }
 
