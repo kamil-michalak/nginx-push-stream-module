@@ -41,11 +41,26 @@ static ngx_inline void ngx_http_push_stream_process_worker_message_data(ngx_http
  * ngx_http_push_stream_socketpairs (below) is a plain BSS global, zero-
  * initialized by the C runtime, i.e. {0,0} for every slot at process start -
  * NOT {NGX_INVALID_FILE, NGX_INVALID_FILE}. Slot 0/0 would look like "fd 0
- * (stdin) held open" if compared against NGX_INVALID_FILE naively. This
- * flag lets ngx_http_push_stream_init_ipc() tell "first run this process"
- * (nothing to close yet) apart from "reload" (may hold fds from the
- * previous generation that must be closed before being overwritten) without
- * depending on the array's initial contents.
+ * (stdin) held open" if compared against NGX_INVALID_FILE naively.
+ *
+ * This flag guards a ONE-TIME sweep (below, first thing in
+ * ngx_http_push_stream_init_ipc) that stamps every slot in the array to
+ * NGX_INVALID_FILE exactly once, on the very first call in this process's
+ * lifetime. From then on, a plain per-slot "!= NGX_INVALID_FILE" check is a
+ * trustworthy signal of "this slot currently holds a real, open socketpair"
+ * on every subsequent call (i.e. every reload).
+ *
+ * This has to be a one-time sweep of the WHOLE array up front, not a flag
+ * checked per-slot inside the loop below: on "nginx -s reload", the
+ * "find empty existing slot" search below normally lands on slots the
+ * OLD generation's still-running workers are NOT occupying - i.e. slots
+ * this process has never written a real socketpair into before - while the
+ * genuinely-in-use old slots (still held by the old workers finishing up)
+ * are skipped entirely. A global "have we run before" flag would have
+ * wrongly told the loop those never-touched slots (still raw {0,0} BSS
+ * bytes) already held a real pair, and closed fd 0/whatever those zero
+ * bytes happened to look like - which is exactly what broke publish
+ * notifications after the first reload following a fresh start.
  */
 static ngx_flag_t ngx_http_push_stream_ipc_initialized = 0;
 
@@ -56,6 +71,13 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
     int         i, s = 0, on = 1;
     ngx_int_t   last_expected_process = ngx_last_process;
 
+    if (!ngx_http_push_stream_ipc_initialized) {
+        for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+            ngx_http_push_stream_socketpairs[i][0] = NGX_INVALID_FILE;
+            ngx_http_push_stream_socketpairs[i][1] = NGX_INVALID_FILE;
+        }
+        ngx_http_push_stream_ipc_initialized = 1;
+    }
 
     /*
      * here's the deal: we have no control over fork()ing, nginx's internal
@@ -77,15 +99,16 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
         // copypaste from os/unix/ngx_process.c (ngx_spawn_process)
         ngx_socket_t    *socks = ngx_http_push_stream_socketpairs[s];
 
-        /* On "nginx -s reload" this function runs again, in the same master
-           process, for the same NGX_MAX_PROCESSES-sized static array - while
-           the previous generation's workers may still be running and using
-           the socketpair fds currently sitting in this slot. socketpair()
-           below overwrites socks[0]/socks[1] with two brand new fds; without
-           closing the old ones first here, they're simply forgotten (never
-           closed by anyone), leaking 2 file descriptors per worker slot on
-           every reload until the process eventually hits its fd limit. */
-        if (ngx_http_push_stream_ipc_initialized) {
+        /* On "nginx -s reload", the slot search above can land on a slot
+           some EARLIER (not necessarily the immediately previous) reload
+           generation used and whose workers have since fully exited and
+           been reaped - i.e. a slot that genuinely still holds a stale,
+           never-closed pair from that earlier generation. socketpair()
+           below overwrites socks[0]/socks[1] with two brand new fds;
+           without closing the old ones first here, they're simply
+           forgotten (never closed by anyone), leaking 2 file descriptors
+           per occurrence until the process eventually hits its fd limit. */
+        if (socks[0] != NGX_INVALID_FILE || socks[1] != NGX_INVALID_FILE) {
             ngx_close_channel(socks, cycle->log);
             socks[0] = NGX_INVALID_FILE;
             socks[1] = NGX_INVALID_FILE;
@@ -128,8 +151,6 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
 
         s++; // NEXT!!
     }
-
-    ngx_http_push_stream_ipc_initialized = 1;
 
     return NGX_OK;
 }
