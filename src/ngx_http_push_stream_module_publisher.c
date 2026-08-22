@@ -247,7 +247,7 @@ ngx_http_push_stream_publisher_delete_handler(ngx_http_request_t *r)
 static void
 ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 {
-    ngx_str_t                              *event_id, *event_type;
+    ngx_str_t                              *event_id, *event_type, *message_ttl_header;
     ngx_http_push_stream_module_ctx_t      *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_main_conf_t       *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_loc_conf_t        *cf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
@@ -273,11 +273,12 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 
     event_id = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_ID);
     event_type = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE);
+    message_ttl_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL);
 
     for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, cf->store_messages, r->pool) != NGX_OK) {
+        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, message_ttl_header, cf->store_messages, r->pool) != NGX_OK) {
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         }

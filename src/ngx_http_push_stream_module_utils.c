@@ -890,7 +890,7 @@ ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, 
 
 
 ngx_int_t
-ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_flag_t store_messages, ngx_pool_t *temp_pool)
+ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool)
 {
     ngx_http_push_stream_shm_data_t        *data = mcf->shm_data;
     ngx_http_push_stream_msg_t             *msg;
@@ -898,8 +898,33 @@ ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, n
     ngx_int_t                               id;
     time_t                                  time;
     ngx_int_t                               tag;
+    ngx_int_t                               parsed_ttl;
+
+    /* parse (but don't yet apply) an explicit per-channel TTL override before
+       taking any locks - cheap, and keeps the critical section below no
+       bigger than it already was. A malformed value is logged and ignored
+       (falls back to whatever TTL the channel already had / the global
+       default), rather than failing the whole publish. */
+    /* 0 is deliberately treated as invalid, not "expire immediately" - same
+       rule push_stream_message_ttl itself enforces at config time ("cannot
+       be zero"), and it keeps 0 unambiguous as the channel struct's
+       "not set yet" sentinel below. */
+    parsed_ttl = -1;
+    if (message_ttl_header != NULL) {
+        parsed_ttl = ngx_atoi(message_ttl_header->data, message_ttl_header->len);
+        if (parsed_ttl == NGX_ERROR || parsed_ttl <= 0) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                "push stream module: invalid %V header value \"%V\", ignoring",
+                &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL, message_ttl_header);
+            parsed_ttl = -1;
+        }
+    }
 
     ngx_shmtx_lock(channel->mutex);
+
+    if (parsed_ttl > 0) {
+        channel->message_ttl = (time_t) parsed_ttl;
+    }
 
     ngx_shmtx_lock(&data->shpool->mutex);
 
@@ -925,8 +950,9 @@ ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, n
     // tag message with time stamp and a sequence tag
     channel->last_message_time = msg->time;
     channel->last_message_tag = msg->tag;
-    // set message expiration time
-    msg->expires = msg->time + mcf->message_ttl;
+    // set message expiration time - per-channel override (Message-TTL header,
+    // remembered on the channel) takes precedence over the global default
+    msg->expires = msg->time + ((channel->message_ttl > 0) ? channel->message_ttl : mcf->message_ttl);
     channel->expires = ngx_time() + mcf->channel_inactivity_time;
 
     // put messages on the queue
@@ -981,7 +1007,7 @@ ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t
         ngx_str_t *event = ngx_http_push_stream_create_str(temp_pool, len);
         if (event != NULL) {
             ngx_sprintf(event->data, NGX_HTTP_PUSH_STREAM_EVENT_TEMPLATE, event_type, &channel->id);
-            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, 1, temp_pool);
+            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, NULL, 1, temp_pool);
         }
 
         if ((received_temp_pool == NULL) && (temp_pool != NULL)) {

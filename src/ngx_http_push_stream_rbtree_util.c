@@ -153,6 +153,7 @@ ngx_http_push_stream_get_channel(ngx_str_t *id, ngx_log_t *log, ngx_http_push_st
     channel->deleted = 0;
     channel->for_events = ((mcf->events_channel_id.len > 0) && (channel->id.len == mcf->events_channel_id.len) && (ngx_strncmp(channel->id.data, mcf->events_channel_id.data, mcf->events_channel_id.len) == 0));
     channel->expires = ngx_time() + mcf->channel_inactivity_time;
+    channel->message_ttl = 0; /* unset - falls back to mcf->message_ttl until a Message-TTL header sets it */
 
     ngx_queue_init(&channel->message_queue);
     ngx_queue_init(&channel->workers_with_subscribers);

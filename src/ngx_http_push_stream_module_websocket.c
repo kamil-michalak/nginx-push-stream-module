@@ -838,7 +838,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                                 if (subscription->channel->for_events) {
                                     continue;
                                 }
-                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, cf->store_messages, ctx->temp_pool) != NGX_OK) {
+                                /* no Message-TTL override here - WebSocket frames carry no headers to
+                                   read one from. A channel's TTL set earlier via an HTTP publish
+                                   (Message-TTL header, remembered on the channel) still applies. */
+                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, NULL, cf->store_messages, ctx->temp_pool) != NGX_OK) {
                                     goto finalize;
                                 }
                             }

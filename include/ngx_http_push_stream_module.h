@@ -286,6 +286,13 @@ struct ngx_http_push_stream_channel_s {
     ngx_queue_t                         workers_with_subscribers;
     ngx_queue_t                         message_queue;
     time_t                              expires;
+    /* per-channel override of push_stream_message_ttl, in seconds; 0 means
+       "not set - use mcf->message_ttl". Set via the Message-TTL publish
+       header (NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL) and applied in
+       ngx_http_push_stream_add_msg_to_channel(). Lives here (shared memory,
+       on the channel struct that already survives reload) rather than in
+       any per-cycle config struct, so it isn't lost on "nginx -s reload". */
+    time_t                              message_ttl;
     ngx_flag_t                          deleted;
     ngx_flag_t                          wildcard;
     char                                for_events;
@@ -470,6 +477,14 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_DATE_FORMAT_ISO_8601 = ngx_string("
 // headers
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EVENT_ID = ngx_string("Event-Id");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE = ngx_string("Event-Type");
+/* Optional per-publish header overriding push_stream_message_ttl for the
+   target channel(s). A non-negative integer, in seconds - same units as
+   push_stream_message_ttl. Sticks to the channel (persisted in shared
+   memory on the channel struct) until a publish sets a different value -
+   so it doesn't need to be sent on every request, only when you want to
+   change (or first set) that channel's TTL. See
+   ngx_http_push_stream_add_msg_to_channel(). */
+static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL = ngx_string("Message-TTL");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_LAST_EVENT_ID = ngx_string("Last-Event-Id");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_ALLOW = ngx_string("Allow");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EXPLAIN = ngx_string("X-Nginx-PushStream-Explain");
