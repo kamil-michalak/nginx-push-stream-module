@@ -233,10 +233,13 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED = ngx_stri
 
 ngx_event_t         ngx_http_push_stream_memory_cleanup_event;
 ngx_event_t         ngx_http_push_stream_buffer_cleanup_event;
+ngx_event_t         ngx_http_push_stream_shm_stats_event;
 
 // general request handling
-ngx_http_push_stream_msg_t *ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool);
+ngx_http_push_stream_msg_t *ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content);
 ngx_http_push_stream_msg_t *ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, ngx_str_t *text, ngx_pool_t *temp_pool);
+ngx_http_push_stream_shared_raw_content_t *ngx_http_push_stream_alloc_raw_content(ngx_slab_pool_t *shpool, u_char *data, size_t len, const char *diag_where);
+void                         ngx_http_push_stream_raw_content_unref(ngx_slab_pool_t *shpool, ngx_http_push_stream_shared_raw_content_t *rc);
 static ngx_int_t            ngx_http_push_stream_send_only_added_headers(ngx_http_request_t *r);
 static void                 ngx_http_push_stream_add_polling_headers(ngx_http_request_t *r, time_t last_modified_time, ngx_int_t tag, ngx_pool_t *temp_pool);
 static void                 ngx_http_push_stream_get_last_received_message_values(ngx_http_request_t *r, time_t *if_modified_since, ngx_int_t *tag, ngx_str_t **last_event_id);
@@ -263,19 +266,24 @@ static void                 ngx_http_push_stream_unescape_uri(ngx_str_t *value);
 static void                 ngx_http_push_stream_complex_value(ngx_http_request_t *r, ngx_http_complex_value_t *val, ngx_str_t *value);
 
 
-ngx_int_t                   ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool);
+ngx_int_t                   ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content);
 ngx_int_t                   ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, ngx_str_t *event_id, ngx_pool_t *temp_pool);
 
 static void                 ngx_http_push_stream_ping_timer_wake_handler(ngx_event_t *ev);
 static void                 ngx_http_push_stream_disconnect_timer_wake_handler(ngx_event_t *ev);
 static void                 ngx_http_push_stream_memory_cleanup_timer_wake_handler(ngx_event_t *ev);
 static void                 ngx_http_push_stream_buffer_timer_wake_handler(ngx_event_t *ev);
+static void                 ngx_http_push_stream_shm_stats_timer_wake_handler(ngx_event_t *ev);
 
 static void                 ngx_http_push_stream_timer_set(ngx_msec_t timer_interval, ngx_event_t *event, ngx_event_handler_pt event_handler, ngx_flag_t start_timer);
 static void                 ngx_http_push_stream_timer_reset(ngx_msec_t timer_interval, ngx_event_t *timer_event);
 
 #define ngx_http_push_stream_memory_cleanup_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_INTERVAL, &ngx_http_push_stream_memory_cleanup_event, ngx_http_push_stream_memory_cleanup_timer_wake_handler, 1);
 #define ngx_http_push_stream_buffer_cleanup_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_MESSAGE_BUFFER_CLEANUP_INTERVAL, &ngx_http_push_stream_buffer_cleanup_event, ngx_http_push_stream_buffer_timer_wake_handler, 1);
+/* 10 minutes - periodic INFO-level shared memory usage snapshot, see
+   ngx_http_push_stream_log_shm_stats() for what it logs and why. */
+#define NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL                   600000
+#define ngx_http_push_stream_shm_stats_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL, &ngx_http_push_stream_shm_stats_event, ngx_http_push_stream_shm_stats_timer_wake_handler, 1);
 
 static void                 ngx_http_push_stream_worker_subscriber_cleanup(ngx_http_push_stream_subscriber_t *worker_subscriber);
 static ngx_str_t *          ngx_http_push_stream_create_str(ngx_pool_t *pool, uint len);

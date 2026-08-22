@@ -833,6 +833,20 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                                    && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_SUBSCRIBE
                                    && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_UNSUBSCRIBE
                                    && cmd != NGX_HTTP_PUSH_STREAM_WEBSOCKET_CMD_PING) {
+                            /* one websocket frame can fan out to every channel this
+                               connection is subscribed to, same as an HTTP publish can
+                               target several channels at once - build ONE shared copy of
+                               the frame payload up front and hand it to each channel's
+                               add_msg_to_channel() call below instead of letting each one
+                               copy the same bytes independently. See the struct comment
+                               on ngx_http_push_stream_shared_raw_content_s. */
+                            ngx_http_push_stream_shared_raw_content_t *shared_raw_content =
+                                ngx_http_push_stream_alloc_raw_content(mcf->shpool, ctx->frame->payload, ctx->frame->payload_len,
+                                    "websocket_publish:raw_content");
+                            if (shared_raw_content == NULL) {
+                                goto finalize;
+                            }
+
                             for (q = ngx_queue_head(&ctx->subscriber->subscriptions); q != ngx_queue_sentinel(&ctx->subscriber->subscriptions); q = ngx_queue_next(q)) {
                                 ngx_http_push_stream_subscription_t *subscription = ngx_queue_data(q, ngx_http_push_stream_subscription_t, queue);
                                 if (subscription->channel->for_events) {
@@ -841,10 +855,15 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                                 /* no Message-TTL override here - WebSocket frames carry no headers to
                                    read one from. A channel's TTL set earlier via an HTTP publish
                                    (Message-TTL header, remembered on the channel) still applies. */
-                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, NULL, cf->store_messages, ctx->temp_pool) != NGX_OK) {
+                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, NULL, cf->store_messages, ctx->temp_pool, shared_raw_content) != NGX_OK) {
+                                    /* drop the loop's own transient reference before bailing -
+                                       any channel that already attached successfully keeps its own */
+                                    ngx_http_push_stream_raw_content_unref(mcf->shpool, shared_raw_content);
                                     goto finalize;
                                 }
                             }
+
+                            ngx_http_push_stream_raw_content_unref(mcf->shpool, shared_raw_content);
                         }
                     }
                 }

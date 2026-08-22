@@ -88,6 +88,7 @@ typedef struct ngx_http_push_stream_shm_data_s ngx_http_push_stream_shm_data_t;
 typedef struct ngx_http_push_stream_global_shm_data_s ngx_http_push_stream_global_shm_data_t;
 typedef struct ngx_http_push_stream_channel_s ngx_http_push_stream_channel_t;
 typedef struct ngx_http_push_stream_shared_ping_msg_s ngx_http_push_stream_shared_ping_msg_t;
+typedef struct ngx_http_push_stream_shared_raw_content_s ngx_http_push_stream_shared_raw_content_t;
 
 /*
  * Fixed-size chunk for storing large (formatted/compressed) message content
@@ -118,6 +119,53 @@ struct ngx_http_push_stream_chunk_s {
     ngx_http_push_stream_chunk_t   *next;
     size_t                          len;   /* bytes used in this chunk (== CHUNK_SIZE except possibly the last one) */
     u_char                          data[NGX_HTTP_PUSH_STREAM_CHUNK_SIZE];
+};
+
+/*
+ * Refcounted shared-memory holder for one publish's raw message body.
+ *
+ * A single publish request can target many channels at once
+ * (push_stream_channels_path with a comma-separated list, or a wildcard
+ * match). Each targeted channel gets its OWN ngx_http_push_stream_msg_t
+ * (own id/time/tag sequence, own queue entry, own expiry) - that part is
+ * inherent to per-channel message history and isn't changing. But the raw
+ * message TEXT is byte-for-byte identical across all of them, since it all
+ * comes from the same publisher request body. Previously each channel's
+ * msg allocated (and later freed) its own independent copy of that text in
+ * shared memory; for a publish fanned out to N channels, that's N copies of
+ * the same bytes.
+ *
+ * This struct lets those N messages share ONE underlying allocation
+ * instead: built once by the publisher before its per-channel loop
+ * (ngx_http_push_stream_publisher_body_handler), then attached to each
+ * channel's msg via ngx_http_push_stream_convert_char_to_msg_on_shared's
+ * shared_raw_content parameter, which bumps refcount once per successful
+ * attach. Each channel's msg still frees independently (on its own expiry
+ * schedule, from whichever worker's cleanup timer gets there first) via
+ * ngx_http_push_stream_free_message_memory - freeing decrements refcount
+ * and only actually releases the content once every attached channel (and
+ * the publisher's own transient build-time reference, released right after
+ * the per-channel loop finishes) has dropped its reference. Since different
+ * channels' messages can expire independently in different worker
+ * processes, refcount is always read/modified under shpool->mutex - the
+ * same cross-process lock already used for the slab allocator itself and
+ * for msg->workers_ref_count elsewhere in this module - never a plain
+ * increment/decrement.
+ *
+ * A publish targeting a single channel (the common case) still goes
+ * through this same struct, just with refcount starting and ending at 1 -
+ * no separate code path, so there is only one way raw content is stored
+ * and freed.
+ */
+struct ngx_http_push_stream_shared_raw_content_s {
+    ngx_str_t                       direct;    /* same "small vs chunked" convention as
+                                                    ngx_http_push_stream_alloc_content: direct.data != NULL
+                                                    => small, contiguous; direct.data == NULL && chunks != NULL
+                                                    => large, chunked. direct.len holds the TOTAL length either way. */
+    ngx_http_push_stream_chunk_t   *chunks;
+    ngx_uint_t                       refcount;  /* number of channel messages currently pointing at this content,
+                                                    plus 1 while the publisher that built it is still looping over
+                                                    channels - guarded by shpool->mutex, see comment above */
 };
 
 typedef struct {
@@ -197,20 +245,18 @@ struct ngx_http_push_stream_msg_s {
     time_t                          time;
     ngx_flag_t                      deleted;
     ngx_int_t                       id;
-    ngx_str_t                       raw;
-    /* Same "small vs chunked" convention as formatted_chunks/compressed_chunks
-       below, but a single pointer (not an array) since there is only one
-       raw content per message, not one per template. raw.data == NULL &&
-       raw_chunks != NULL means chunked; raw.len holds the TOTAL length either
-       way. Note: template substitution (ngx_http_push_stream_format_message
-       et al, called during message creation) never reads from raw/raw_chunks
-       directly - it reads from the ORIGINAL caller-supplied data/len buffer
-       instead, which is always contiguous (regular pool memory, not shared
-       memory, so never subject to slab fragmentation). raw/raw_chunks exists
-       purely as a shared-memory COPY for later retrieval - e.g. the
-       "no message_template configured" fallback in get_formatted_message(),
-       which can send raw directly to a subscriber. */
-    ngx_http_push_stream_chunk_t   *raw_chunks;
+    /*
+     * Raw message text, in shared memory, possibly shared with OTHER
+     * channels' messages from the same fan-out publish - see the comment on
+     * ngx_http_push_stream_shared_raw_content_s above. Never NULL for a
+     * successfully-built message (ngx_http_push_stream_convert_char_to_msg_on_shared
+     * always attaches one, whether passed in by the publisher or built
+     * on the spot for a single-target message like a ping or timeout
+     * notification). Used as the SOURCE for the eager per-template
+     * formatting below, and directly as the response body for the
+     * "no push_stream_message_template configured" case.
+     */
+    ngx_http_push_stream_shared_raw_content_t *raw_content;
     ngx_int_t                       tag;
     ngx_str_t                      *event_id;
     ngx_str_t                      *event_type;

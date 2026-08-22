@@ -252,6 +252,7 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     ngx_http_push_stream_main_conf_t       *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_loc_conf_t        *cf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
     ngx_buf_t                              *buf = NULL;
+    ngx_http_push_stream_shared_raw_content_t      *shared_raw_content;
 
     ngx_http_push_stream_requested_channel_t       *requested_channel;
     ngx_queue_t                                    *q;
@@ -275,14 +276,39 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     event_type = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE);
     message_ttl_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL);
 
+    /* A single publish can target many channels at once
+       (push_stream_channels_path with a comma-separated list, or a wildcard
+       match) - the message body is identical for all of them, so build ONE
+       shared copy of it up front and hand it to every per-channel
+       add_msg_to_channel() call below, instead of each one copying the same
+       bytes into shared memory independently. See the struct comment on
+       ngx_http_push_stream_shared_raw_content_s in ngx_http_push_stream_module.h
+       for the full rationale and the refcounting contract this relies on. */
+    shared_raw_content =
+        ngx_http_push_stream_alloc_raw_content(mcf->shpool, buf->pos, ngx_buf_size(buf), "publisher_body_handler:raw_content");
+    if (shared_raw_content == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate message in shared memory");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
     for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, message_ttl_header, cf->store_messages, r->pool) != NGX_OK) {
+        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, message_ttl_header, cf->store_messages, r->pool, shared_raw_content) != NGX_OK) {
+            /* drop the loop's own transient reference before bailing - any
+               channel that already attached successfully still holds its own,
+               so this doesn't free content those channels are relying on */
+            ngx_http_push_stream_raw_content_unref(mcf->shpool, shared_raw_content);
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         }
     }
+
+    /* drop the loop's own transient reference; every channel that attached
+       above still holds its own, so the content stays alive for as long as
+       any of them keep it, and only actually frees once the last one does */
+    ngx_http_push_stream_raw_content_unref(mcf->shpool, shared_raw_content);
 
     if (cf->channel_info_on_publish) {
         ngx_http_push_stream_send_response_channels_info_detailed(r, ctx->requested_channels);

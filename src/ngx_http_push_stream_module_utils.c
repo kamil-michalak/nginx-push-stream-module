@@ -42,6 +42,38 @@ static ngx_inline void ngx_http_push_stream_cleanup_shutting_down_worker_data(ng
 ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r, ngx_chain_t *in);
 
 /*
+ * Rough free-page count for a slab zone: walks the free page list under the
+ * slab mutex. O(free pages) - fine for the (rare, critical) alloc-failure
+ * path this was written for, and acceptable for the periodic informational
+ * snapshot that also uses it now (see ngx_http_push_stream_log_shm_stats)
+ * since that only runs once per configured interval, not per-request.
+ */
+static void
+ngx_http_push_stream_shm_free_pages(ngx_slab_pool_t *shpool, size_t *total_size, ngx_uint_t *free_pages)
+{
+    ngx_slab_page_t *page;
+    size_t           pagesize = ngx_pagesize;
+
+    *free_pages = 0;
+
+    ngx_shmtx_lock(&shpool->mutex);
+    *total_size = (size_t) (shpool->end - shpool->start);
+    for (page = shpool->free.next; page != &shpool->free; page = page->next) {
+        (*free_pages)++;
+        /* safety cap: shared memory could theoretically be corrupted (e.g. after
+           a previous crash mid-allocation) - never walk more "pages" than could
+           possibly fit in the zone, to avoid an infinite loop here too. */
+        if (*free_pages > (*total_size / pagesize) + 1) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                "push stream module: free page list looks corrupted "
+                "(walked more pages than fit in zone) - aborting walk");
+            break;
+        }
+    }
+    ngx_shmtx_unlock(&shpool->mutex);
+}
+
+/*
  * DIAGNOSTIC: logs context (requested size + a rough free-space estimate)
  * whenever a shared-memory slab allocation fails, to help distinguish
  * genuine exhaustion (everything failing, free pages near zero) from
@@ -52,33 +84,50 @@ ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r
 static void
 ngx_http_push_stream_log_slab_alloc_failure(ngx_slab_pool_t *shpool, size_t requested_size, const char *where)
 {
-    ngx_slab_page_t *page;
-    ngx_uint_t       free_pages = 0;
-    size_t           total_size = 0;
-    size_t           pagesize   = ngx_pagesize;
+    ngx_uint_t       free_pages;
+    size_t           total_size;
+    size_t           pagesize = ngx_pagesize;
 
-    /* rough free-page count: walk the free page list under the slab mutex.
-       This is O(free pages) but only runs on the (rare, critical) failure path. */
-    ngx_shmtx_lock(&shpool->mutex);
-    total_size = (size_t) (shpool->end - shpool->start);
-    for (page = shpool->free.next; page != &shpool->free; page = page->next) {
-        free_pages++;
-        /* safety cap: shared memory could theoretically be corrupted (e.g. after
-           a previous crash mid-allocation) - never walk more "pages" than could
-           possibly fit in the zone, to avoid an infinite loop here too. */
-        if (free_pages > (total_size / pagesize) + 1) {
-            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
-                "push stream module: free page list looks corrupted "
-                "(walked more pages than fit in zone) - aborting walk");
-            break;
-        }
-    }
-    ngx_shmtx_unlock(&shpool->mutex);
+    ngx_http_push_stream_shm_free_pages(shpool, &total_size, &free_pages);
 
     ngx_log_error(NGX_LOG_CRIT, ngx_cycle->log, 0,
         "push stream module: slab alloc failed at [%s], requested %uz bytes; "
         "zone total=%uzM, free_pages~=%ui (%uzM), pagesize=%uz",
         where, requested_size,
+        total_size / (1024 * 1024),
+        free_pages, (free_pages * pagesize) / (1024 * 1024),
+        pagesize);
+}
+
+/*
+ * Same free-page snapshot as ngx_http_push_stream_log_slab_alloc_failure(),
+ * but logged unconditionally at INFO level every
+ * NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL (see the periodic timer this
+ * is wired to in ngx_http_push_stream_shm_stats_timer_wake_handler), not
+ * only at the moment an allocation actually fails. Lets someone watching
+ * the logs see the zone/free-page trend over time (e.g. free_pages~=0
+ * creeping up on an otherwise healthy-looking zone) instead of finding out
+ * only when ngx_slab_alloc() first fails and logs a CRIT.
+ *
+ * Runs independently in every worker process, same as the other periodic
+ * timers in this file (ngx_http_push_stream_memory_cleanup_timer_wake_handler,
+ * ngx_http_push_stream_buffer_timer_wake_handler) - all reading the same
+ * shared memory zone, so with N worker_processes this logs N near-identical
+ * lines every interval, one per worker. Left that way for consistency: no
+ * "only worker 0" special-casing exists elsewhere in this module either.
+ */
+static void
+ngx_http_push_stream_log_shm_stats(ngx_slab_pool_t *shpool)
+{
+    ngx_uint_t       free_pages;
+    size_t           total_size;
+    size_t           pagesize = ngx_pagesize;
+
+    ngx_http_push_stream_shm_free_pages(shpool, &total_size, &free_pages);
+
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+        "push stream module: shared memory usage snapshot - "
+        "zone total=%uzM, free_pages~=%ui (%uzM), pagesize=%uz",
         total_size / (1024 * 1024),
         free_pages, (free_pages * pagesize) / (1024 * 1024),
         pagesize);
@@ -105,10 +154,10 @@ ngx_http_push_stream_log_slab_alloc_failure(ngx_slab_pool_t *shpool, size_t requ
  *
  * Only applied to allocations whose size varies with CONTENT (message text,
  * event-id/type, compressed frames) - NOT to fixed-size struct allocations
- * (ngx_http_push_stream_msg_t, ngx_http_push_stream_channel_t, the
- * formatted_messages/compressed_messages arrays), which are already a single
- * consistent size each and don't contribute to this problem, so they are
- * left as-is.
+ * (ngx_http_push_stream_msg_t, ngx_http_push_stream_channel_t,
+ * ngx_http_push_stream_shared_raw_content_t, the formatted_messages/
+ * compressed_messages arrays), which are already a single consistent size
+ * each and don't contribute to this problem, so they are left as-is.
  */
 static ngx_uint_t ngx_http_push_stream_size_buckets[] = {
     64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072
@@ -297,6 +346,118 @@ ngx_http_push_stream_send_content(ngx_http_request_t *r, ngx_str_t *direct, ngx_
 
     return ngx_http_push_stream_output_filter(r, out);
 }
+
+/*
+ * Allocates a fresh, singly-owned ngx_http_push_stream_shared_raw_content_t
+ * wrapping a shared-memory copy of data/len (refcount = 1). Self-locking
+ * (via ngx_http_push_stream_alloc_content), matching that function's own
+ * convention.
+ *
+ * Two kinds of caller:
+ *   - ngx_http_push_stream_convert_char_to_msg_on_shared(), when it wasn't
+ *     handed a pre-built shared_raw_content by its caller (the common,
+ *     single-target case: ping messages, the channel-deleted/timeout
+ *     notifications, events-channel notifications, and a publish targeting
+ *     exactly one channel).
+ *   - the publisher (ngx_http_push_stream_publisher_body_handler), which
+ *     builds ONE of these up front for a publish fanned out to multiple
+ *     channels, then passes it into every per-channel
+ *     ngx_http_push_stream_add_msg_to_channel() call instead of letting
+ *     each one copy the same text independently - see the struct comment
+ *     on ngx_http_push_stream_shared_raw_content_s in the header for the
+ *     full rationale and the refcounting contract.
+ */
+ngx_http_push_stream_shared_raw_content_t *
+ngx_http_push_stream_alloc_raw_content(ngx_slab_pool_t *shpool, u_char *data, size_t len, const char *diag_where)
+{
+    ngx_http_push_stream_shared_raw_content_t *rc;
+
+    if ((rc = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_shared_raw_content_t))) == NULL) {
+        ngx_http_push_stream_log_slab_alloc_failure(shpool, sizeof(ngx_http_push_stream_shared_raw_content_t), diag_where);
+        return NULL;
+    }
+
+    rc->direct.data = NULL;
+    rc->direct.len = 0;
+    rc->chunks = NULL;
+    rc->refcount = 1;
+
+    if (ngx_http_push_stream_alloc_content(shpool, data, len, &rc->direct, &rc->chunks, diag_where) != NGX_OK) {
+        ngx_slab_free(shpool, rc);
+        return NULL;
+    }
+
+    return rc;
+}
+
+
+/* Adds one more reference to an already-built shared_raw_content - used by
+   ngx_http_push_stream_convert_char_to_msg_on_shared() when it's handed a
+   pre-built one instead of building its own. Self-locking: shpool->mutex is
+   NOT held by any caller of convert_char_to_msg_on_shared at the point it
+   calls this (see the comment at that call site). */
+static void
+ngx_http_push_stream_raw_content_ref(ngx_slab_pool_t *shpool, ngx_http_push_stream_shared_raw_content_t *rc)
+{
+    ngx_shmtx_lock(&shpool->mutex);
+    rc->refcount++;
+    ngx_shmtx_unlock(&shpool->mutex);
+}
+
+
+/*
+ * Drops one reference from shared_raw_content, freeing it once the count
+ * reaches zero. Caller-locked - assumes shpool->mutex is already held.
+ * Used from ngx_http_push_stream_free_message_memory(), which wraps its
+ * whole body in a single lock/unlock pair.
+ */
+static void
+ngx_http_push_stream_raw_content_unref_locked(ngx_slab_pool_t *shpool, ngx_http_push_stream_shared_raw_content_t *rc)
+{
+    if (rc == NULL) {
+        return;
+    }
+
+    if (rc->refcount == 0) {
+        /* should never happen - defensive guard against unsigned underflow
+           on a double-unref, which would otherwise wrap refcount to a huge
+           value and leak this content forever rather than free it too
+           early. Leaking a few hundred bytes is the far safer of those two
+           failure modes, so that's the one this deliberately picks. */
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+            "push stream module: raw content unref underflow (already at 0) - leaking to avoid a double free, please report this");
+        return;
+    }
+
+    rc->refcount--;
+    if (rc->refcount > 0) {
+        return;
+    }
+
+    ngx_http_push_stream_free_content_locked(shpool, &rc->direct, rc->chunks);
+    ngx_slab_free_locked(shpool, rc);
+}
+
+
+/*
+ * Self-locking variant of ngx_http_push_stream_raw_content_unref_locked(),
+ * for the one caller that doesn't already hold shpool->mutex: the
+ * publisher, which drops its own transient reference (see the struct
+ * comment) right after its per-channel loop finishes - well outside of any
+ * individual message's own free path.
+ */
+void
+ngx_http_push_stream_raw_content_unref(ngx_slab_pool_t *shpool, ngx_http_push_stream_shared_raw_content_t *rc)
+{
+    if (rc == NULL) {
+        return;
+    }
+
+    ngx_shmtx_lock(&shpool->mutex);
+    ngx_http_push_stream_raw_content_unref_locked(shpool, rc);
+    ngx_shmtx_unlock(&shpool->mutex);
+}
+
 
 static void            ngx_http_push_stream_flush_pending_output(ngx_http_request_t *r);
 
@@ -534,6 +695,10 @@ ngx_http_push_stream_cleanup_shutting_down_worker_data(ngx_http_push_stream_shm_
         ngx_del_timer(&ngx_http_push_stream_buffer_cleanup_event);
     }
 
+    if (ngx_http_push_stream_shm_stats_event.timer_set) {
+        ngx_del_timer(&ngx_http_push_stream_shm_stats_event);
+    }
+
     ngx_http_push_stream_clean_worker_data(data);
 }
 
@@ -646,17 +811,20 @@ ngx_http_push_stream_deflate_websocket_frame(const u_char *payload, off_t payloa
 #endif /* NGX_HAVE_ZLIB */
 
 ngx_http_push_stream_msg_t *
-ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool)
+ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content)
 {
     ngx_slab_pool_t                           *shpool = mcf->shpool;
     ngx_queue_t                               *q;
     ngx_http_push_stream_msg_t                *msg;
     int                                        i = 0;
     /* Wraps the ORIGINAL caller-supplied buffer (not yet in shared memory,
-       always contiguous - regular pool memory). Used for template
-       substitution below instead of msg->raw, since msg->raw may end up
-       chunked (non-contiguous) for large content. See the comment on
-       msg->raw_chunks in the header for the full rationale. */
+       always contiguous - regular pool memory), used as the SOURCE for
+       template substitution below. Deliberately NOT read from msg->raw_content:
+       that may be a shared_raw_content the caller passed in (built once for
+       a multi-channel publish, see the struct comment in
+       ngx_http_push_stream_module.h) or may end up chunked (non-contiguous)
+       for large content either way - original_data is always this
+       function's own contiguous input, independent of either of those. */
     ngx_str_t original_data = { len, data };
 
     if ((msg = ngx_slab_alloc(shpool, sizeof(ngx_http_push_stream_msg_t))) == NULL) {
@@ -668,11 +836,11 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->event_type = NULL;
     msg->event_id_message = NULL;
     msg->event_type_message = NULL;
+    msg->raw_content = NULL;
     msg->formatted_messages = NULL;
     msg->compressed_messages = NULL;
     msg->formatted_chunks = NULL;
     msg->compressed_chunks = NULL;
-    msg->raw_chunks = NULL;
     msg->deleted = 0;
     msg->expires = 0;
     msg->id = id;
@@ -682,18 +850,30 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     msg->qtd_templates = mcf->qtd_templates;
     ngx_queue_init(&msg->queue);
 
-    if (ngx_http_push_stream_alloc_content(shpool, data, len,
-            &msg->raw, &msg->raw_chunks,
-            "convert_char_to_msg:raw_data") != NGX_OK) {
-        ngx_http_push_stream_free_message_memory(shpool, msg);
-        return NULL;
+    /* Attach the raw message text: either take a reference on a
+       shared_raw_content the caller already built (a multi-channel publish
+       sharing ONE copy across every targeted channel's message - see the
+       struct comment in ngx_http_push_stream_module.h), or build a fresh,
+       singly-owned one now (every other caller: ping messages, the
+       channel-deleted/timeout notifications, events-channel notifications,
+       and a publish targeting exactly one channel). Either way,
+       shpool->mutex is not held by any caller of this function at this
+       point, so both paths below are free to self-lock. */
+    if (shared_raw_content != NULL) {
+        ngx_http_push_stream_raw_content_ref(shpool, shared_raw_content);
+        msg->raw_content = shared_raw_content;
+    } else {
+        msg->raw_content = ngx_http_push_stream_alloc_raw_content(shpool, data, len, "convert_char_to_msg:raw_data");
+        if (msg->raw_content == NULL) {
+            ngx_http_push_stream_free_message_memory(shpool, msg);
+            return NULL;
+        }
     }
-    /* Note: unlike the original single-allocation code, raw.data is no
-       longer null-terminated (alloc_content only reserves exactly `len`
+    /* Note: unlike the original single-allocation code, the stored content is
+       no longer null-terminated (alloc_content only reserves exactly `len`
        bytes, rounded up to a bucket - not len+1). Verified no consumer in
-       this codebase relies on null-termination of msg->raw.data; every
-       reader uses the ngx_str_t (length-bounded) interface. */
-
+       this codebase relies on null-termination of it; every reader uses the
+       ngx_str_t (length-bounded) interface. */
 
     if (ngx_http_push_stream_apply_text_template(&msg->event_id, &msg->event_id_message, event_id, &NGX_HTTP_PUSH_STREAM_EVENTSOURCE_ID_TEMPLATE, &NGX_HTTP_PUSH_STREAM_TOKEN_MESSAGE_EVENT_ID, shpool, temp_pool) != NGX_OK) {
         ngx_http_push_stream_free_message_memory(shpool, msg);
@@ -830,9 +1010,9 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
  * effect at that time) and then reused for as long as the ping text stays
  * the same, even across reloads that change push_stream_message_template.
  * ngx_http_push_stream_get_formatted_message() already falls back to
- * ->raw for a template index beyond a message's qtd_templates (see the
- * reload_memory_leak fix), so this is a stale-formatting edge case, not a
- * safety issue - deliberately accepted to avoid ever needing to free an
+ * ->raw_content for a template index beyond a message's qtd_templates (see
+ * the reload_memory_leak fix), so this is a stale-formatting edge case, not
+ * a safety issue - deliberately accepted to avoid ever needing to free an
  * entry a still-running old worker might be using concurrently.
  */
 ngx_http_push_stream_msg_t *
@@ -858,7 +1038,7 @@ ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, 
        so two workers racing to build the same text can't both succeed and
        leak one of the two results */
     if ((msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text->data, text->len, NULL,
-            NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool)) == NULL) {
+            NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL)) == NULL) {
         ngx_shmtx_unlock(&data->ping_msgs_mutex);
         return NULL;
     }
@@ -890,7 +1070,7 @@ ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, 
 
 
 ngx_int_t
-ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool)
+ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content)
 {
     ngx_http_push_stream_shm_data_t        *data = mcf->shm_data;
     ngx_http_push_stream_msg_t             *msg;
@@ -938,7 +1118,7 @@ ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, n
     ngx_shmtx_unlock(&data->shpool->mutex);
 
     // create a buffer copy in shared mem
-    msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, id, event_id, event_type, time, tag, temp_pool);
+    msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, id, event_id, event_type, time, tag, temp_pool, shared_raw_content);
     if (msg == NULL) {
         ngx_shmtx_unlock(channel->mutex);
         ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate message in shared memory");
@@ -1007,7 +1187,7 @@ ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t
         ngx_str_t *event = ngx_http_push_stream_create_str(temp_pool, len);
         if (event != NULL) {
             ngx_sprintf(event->data, NGX_HTTP_PUSH_STREAM_EVENT_TEMPLATE, event_type, &channel->id);
-            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, NULL, 1, temp_pool);
+            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, NULL, 1, temp_pool, NULL);
         }
 
         if ((received_temp_pool == NULL) && (temp_pool != NULL)) {
@@ -1480,7 +1660,7 @@ ngx_http_push_stream_send_response_finalize_for_longpolling_by_timeout(ngx_http_
 
     if (mcf->timeout_with_body && (mcf->longpooling_timeout_msg == NULL)) {
         // create longpooling timeout message
-        if ((mcf->longpooling_timeout_msg == NULL) && (mcf->longpooling_timeout_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, (u_char *) NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT, ngx_strlen(NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT), NULL, NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_ID, NULL, NULL, 0, 0, r->pool)) == NULL) {
+        if ((mcf->longpooling_timeout_msg == NULL) && (mcf->longpooling_timeout_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, (u_char *) NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT, ngx_strlen(NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT), NULL, NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_ID, NULL, NULL, 0, 0, r->pool, NULL)) == NULL) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate long pooling timeout message in shared memory");
         }
     }
@@ -1548,7 +1728,7 @@ ngx_http_push_stream_delete_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_h
 
     if (deleted) {
         // apply channel deleted message text to message template - outside the lock
-        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool)) == NULL) {
+        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL)) == NULL) {
             ngx_log_error(NGX_LOG_ERR, temp_pool->log, 0, "push stream module: unable to allocate memory to channel deleted message");
             /* channel is already unlinked and marked deleted - it will still be
                processed by delete_channels_data()/collect_deleted_channels_data(),
@@ -1890,9 +2070,11 @@ ngx_http_push_stream_free_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_
     }
 #endif
 
-    if ((msg->raw.data != NULL) || (msg->raw_chunks != NULL)) {
-        ngx_http_push_stream_free_content_locked(shpool, &msg->raw, msg->raw_chunks);
-    }
+    /* drops this message's reference on its (possibly shared, see
+       ngx_http_push_stream_shared_raw_content_s) raw content; only actually
+       frees the content once every referencing message has done so */
+    ngx_http_push_stream_raw_content_unref_locked(shpool, msg->raw_content);
+
     if (msg->event_id != NULL) ngx_slab_free_locked(shpool, msg->event_id);
     if (msg->event_type != NULL) ngx_slab_free_locked(shpool, msg->event_type);
     if (msg->event_id_message != NULL) ngx_slab_free_locked(shpool, msg->event_id_message);
@@ -2050,6 +2232,30 @@ ngx_http_push_stream_buffer_timer_wake_handler(ngx_event_t *ev)
     ngx_http_push_stream_timer_reset(NGX_HTTP_PUSH_STREAM_MESSAGE_BUFFER_CLEANUP_INTERVAL, &ngx_http_push_stream_buffer_cleanup_event);
 }
 
+/*
+ * Fires every NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL (10 minutes) and
+ * logs an INFO-level shared memory usage snapshot for each shared memory
+ * zone this worker knows about - see ngx_http_push_stream_log_shm_stats()
+ * for the log line format and the per-worker-duplication trade-off.
+ */
+static void
+ngx_http_push_stream_shm_stats_timer_wake_handler(ngx_event_t *ev)
+{
+    ngx_http_push_stream_global_shm_data_t *global_data;
+    ngx_queue_t                            *q;
+
+    if (ngx_http_push_stream_global_shm_zone != NULL) {
+        global_data = (ngx_http_push_stream_global_shm_data_t *) ngx_http_push_stream_global_shm_zone->data;
+
+        for (q = ngx_queue_head(&global_data->shm_datas_queue); q != ngx_queue_sentinel(&global_data->shm_datas_queue); q = ngx_queue_next(q)) {
+            ngx_http_push_stream_shm_data_t *data = ngx_queue_data(q, ngx_http_push_stream_shm_data_t, shm_data_queue);
+            ngx_http_push_stream_log_shm_stats(data->shpool);
+        }
+    }
+
+    ngx_http_push_stream_timer_reset(NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL, &ngx_http_push_stream_shm_stats_event);
+}
+
 static ngx_str_t *
 ngx_http_push_stream_str_replace(const ngx_str_t *org, const ngx_str_t *find, const ngx_str_t *replace, off_t offset, ngx_pool_t *pool)
 {
@@ -2093,8 +2299,8 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
         /* after reload the template count may differ from when the message was created;
            fall back to raw to avoid out-of-bounds access on formatted_messages */
         if ((ngx_uint_t) pslcf->message_template_index > message->qtd_templates) {
-            *out_chunks = message->raw_chunks;
-            return &message->raw;
+            *out_chunks = message->raw_content->chunks;
+            return &message->raw_content->direct;
         }
         ngx_uint_t idx = pslcf->message_template_index - 1;
 #if (NGX_HAVE_ZLIB)
@@ -2112,8 +2318,8 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
         *out_chunks = (message->formatted_chunks != NULL) ? message->formatted_chunks[idx] : NULL;
         return message->formatted_messages + idx;
     }
-    *out_chunks = message->raw_chunks;
-    return &message->raw;
+    *out_chunks = message->raw_content->chunks;
+    return &message->raw_content->direct;
 }
 
 
