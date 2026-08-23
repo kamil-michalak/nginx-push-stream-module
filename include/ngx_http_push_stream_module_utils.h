@@ -56,7 +56,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_PLAIN = ngx_strin
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_PLAIN = ngx_string(CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_PLAIN = ngx_string("hostname: %s" CRLF "time: %s" CRLF "channels: %ui" CRLF "wildcard_channels: %ui" CRLF "published_messages: %ui" CRLF "stored_messages: %ui" CRLF "messages_in_trash: %ui" CRLF "channels_in_delete: %ui" CRLF "channels_in_trash: %ui" CRLF "subscribers: %ui" CRLF "uptime: %ui" CRLF "by_worker:"CRLF"%s" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_PLAIN = ngx_string("hostname: %s" CRLF "time: %s" CRLF "channels: %ui" CRLF "wildcard_channels: %ui" CRLF "published_messages: %ui" CRLF "stored_messages: %ui" CRLF "messages_in_trash: %ui" CRLF "channels_in_delete: %ui" CRLF "channels_in_trash: %ui" CRLF "subscribers: %ui" CRLF "uptime: %ui" CRLF "shm_zone_total_mb: %uz" CRLF "shm_free_pages: %ui" CRLF "shm_free_mb: %uz" CRLF "shm_pagesize: %uz" CRLF "by_worker:"CRLF"%s" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_PLAIN = ngx_string("text/plain");
@@ -69,7 +69,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_JSON = ngx_string
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_JSON = ngx_string("]}" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN CRLF);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_JSON = ngx_string("{\"hostname\": \"%s\", \"time\": \"%s\", \"channels\": %ui, \"wildcard_channels\": %ui, \"published_messages\": %ui, \"stored_messages\": %ui, \"messages_in_trash\": %ui, \"channels_in_delete\": %ui, \"channels_in_trash\": %ui, \"subscribers\": %ui, \"uptime\": %ui, \"by_worker\": [" CRLF "%s" CRLF"]}" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_JSON = ngx_string("{\"hostname\": \"%s\", \"time\": \"%s\", \"channels\": %ui, \"wildcard_channels\": %ui, \"published_messages\": %ui, \"stored_messages\": %ui, \"messages_in_trash\": %ui, \"channels_in_delete\": %ui, \"channels_in_trash\": %ui, \"subscribers\": %ui, \"uptime\": %ui, \"shm_zone_total_mb\": %uz, \"shm_free_pages\": %ui, \"shm_free_mb\": %uz, \"shm_pagesize\": %uz, \"by_worker\": [" CRLF "%s" CRLF"]}" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_JSON = ngx_string("application/json");
@@ -82,7 +82,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_YAML = ngx_string
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_YAML = ngx_string(CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_YAML = ngx_string(" -" CRLF NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_YAML = ngx_string(" -" CRLF NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_YAML = ngx_string("  hostname: %s" CRLF"  time: %s" CRLF"  channels: %ui" CRLF"  wildcard_channels: %ui" CRLF"  published_messages: %ui" CRLF"  stored_messages: %ui" CRLF"  messages_in_trash: %ui" CRLF"  channels_in_delete: %ui" CRLF"  channels_in_trash: %ui" CRLF"  subscribers: %ui" CRLF"  uptime: %ui" CRLF"  by_worker:"CRLF"%s" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_YAML = ngx_string("  hostname: %s" CRLF"  time: %s" CRLF"  channels: %ui" CRLF"  wildcard_channels: %ui" CRLF"  published_messages: %ui" CRLF"  stored_messages: %ui" CRLF"  messages_in_trash: %ui" CRLF"  channels_in_delete: %ui" CRLF"  channels_in_trash: %ui" CRLF"  subscribers: %ui" CRLF"  uptime: %ui" CRLF"  shm_zone_total_mb: %uz" CRLF"  shm_free_pages: %ui" CRLF"  shm_free_mb: %uz" CRLF"  shm_pagesize: %uz" CRLF"  by_worker:"CRLF"%s" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_YAML = ngx_string("   -" CRLF NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_YAML = ngx_string("   -" CRLF NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_YAML = ngx_string("application/yaml");
@@ -121,6 +121,10 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_XML = ngx_string
         "  <channels_in_trash>%ui</channels_in_trash>" CRLF \
         "  <subscribers>%ui</subscribers>" CRLF \
         "  <uptime>%ui</uptime>" CRLF \
+        "  <shm_zone_total_mb>%uz</shm_zone_total_mb>" CRLF \
+        "  <shm_free_pages>%ui</shm_free_pages>" CRLF \
+        "  <shm_free_mb>%uz</shm_free_mb>" CRLF \
+        "  <shm_pagesize>%uz</shm_pagesize>" CRLF \
         "  <by_worker>%s</by_worker>" CRLF \
         "</infos>" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_XML = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_XML_PATTERN);
@@ -233,7 +237,6 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED = ngx_stri
 
 ngx_event_t         ngx_http_push_stream_memory_cleanup_event;
 ngx_event_t         ngx_http_push_stream_buffer_cleanup_event;
-ngx_event_t         ngx_http_push_stream_shm_stats_event;
 
 // general request handling
 ngx_http_push_stream_msg_t *ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content);
@@ -273,17 +276,12 @@ static void                 ngx_http_push_stream_ping_timer_wake_handler(ngx_eve
 static void                 ngx_http_push_stream_disconnect_timer_wake_handler(ngx_event_t *ev);
 static void                 ngx_http_push_stream_memory_cleanup_timer_wake_handler(ngx_event_t *ev);
 static void                 ngx_http_push_stream_buffer_timer_wake_handler(ngx_event_t *ev);
-static void                 ngx_http_push_stream_shm_stats_timer_wake_handler(ngx_event_t *ev);
 
 static void                 ngx_http_push_stream_timer_set(ngx_msec_t timer_interval, ngx_event_t *event, ngx_event_handler_pt event_handler, ngx_flag_t start_timer);
 static void                 ngx_http_push_stream_timer_reset(ngx_msec_t timer_interval, ngx_event_t *timer_event);
 
 #define ngx_http_push_stream_memory_cleanup_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_INTERVAL, &ngx_http_push_stream_memory_cleanup_event, ngx_http_push_stream_memory_cleanup_timer_wake_handler, 1);
 #define ngx_http_push_stream_buffer_cleanup_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_MESSAGE_BUFFER_CLEANUP_INTERVAL, &ngx_http_push_stream_buffer_cleanup_event, ngx_http_push_stream_buffer_timer_wake_handler, 1);
-/* 10 minutes - periodic INFO-level shared memory usage snapshot, see
-   ngx_http_push_stream_log_shm_stats() for what it logs and why. */
-#define NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL                   600000
-#define ngx_http_push_stream_shm_stats_timer_set(void) ngx_http_push_stream_timer_set(NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL, &ngx_http_push_stream_shm_stats_event, ngx_http_push_stream_shm_stats_timer_wake_handler, 1);
 
 static void                 ngx_http_push_stream_worker_subscriber_cleanup(ngx_http_push_stream_subscriber_t *worker_subscriber);
 static ngx_str_t *          ngx_http_push_stream_create_str(ngx_pool_t *pool, uint len);

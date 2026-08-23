@@ -44,9 +44,11 @@ ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r
 /*
  * Rough free-page count for a slab zone: walks the free page list under the
  * slab mutex. O(free pages) - fine for the (rare, critical) alloc-failure
- * path this was written for, and acceptable for the periodic informational
- * snapshot that also uses it now (see ngx_http_push_stream_log_shm_stats)
- * since that only runs once per configured interval, not per-request.
+ * path this was written for, and acceptable for the other, per-request
+ * caller (ngx_http_push_stream_send_response_all_channels_info_summarized,
+ * in ngx_http_push_stream_module.c - the shm_* fields in the full stats
+ * response) too, since that endpoint is a low-frequency monitoring/ops
+ * request, not something called per message.
  */
 static void
 ngx_http_push_stream_shm_free_pages(ngx_slab_pool_t *shpool, size_t *total_size, ngx_uint_t *free_pages)
@@ -94,40 +96,6 @@ ngx_http_push_stream_log_slab_alloc_failure(ngx_slab_pool_t *shpool, size_t requ
         "push stream module: slab alloc failed at [%s], requested %uz bytes; "
         "zone total=%uzM, free_pages~=%ui (%uzM), pagesize=%uz",
         where, requested_size,
-        total_size / (1024 * 1024),
-        free_pages, (free_pages * pagesize) / (1024 * 1024),
-        pagesize);
-}
-
-/*
- * Same free-page snapshot as ngx_http_push_stream_log_slab_alloc_failure(),
- * but logged unconditionally at INFO level every
- * NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL (see the periodic timer this
- * is wired to in ngx_http_push_stream_shm_stats_timer_wake_handler), not
- * only at the moment an allocation actually fails. Lets someone watching
- * the logs see the zone/free-page trend over time (e.g. free_pages~=0
- * creeping up on an otherwise healthy-looking zone) instead of finding out
- * only when ngx_slab_alloc() first fails and logs a CRIT.
- *
- * Runs independently in every worker process, same as the other periodic
- * timers in this file (ngx_http_push_stream_memory_cleanup_timer_wake_handler,
- * ngx_http_push_stream_buffer_timer_wake_handler) - all reading the same
- * shared memory zone, so with N worker_processes this logs N near-identical
- * lines every interval, one per worker. Left that way for consistency: no
- * "only worker 0" special-casing exists elsewhere in this module either.
- */
-static void
-ngx_http_push_stream_log_shm_stats(ngx_slab_pool_t *shpool)
-{
-    ngx_uint_t       free_pages;
-    size_t           total_size;
-    size_t           pagesize = ngx_pagesize;
-
-    ngx_http_push_stream_shm_free_pages(shpool, &total_size, &free_pages);
-
-    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
-        "push stream module: shared memory usage snapshot - "
-        "zone total=%uzM, free_pages~=%ui (%uzM), pagesize=%uz",
         total_size / (1024 * 1024),
         free_pages, (free_pages * pagesize) / (1024 * 1024),
         pagesize);
@@ -693,10 +661,6 @@ ngx_http_push_stream_cleanup_shutting_down_worker_data(ngx_http_push_stream_shm_
 
     if (ngx_http_push_stream_buffer_cleanup_event.timer_set) {
         ngx_del_timer(&ngx_http_push_stream_buffer_cleanup_event);
-    }
-
-    if (ngx_http_push_stream_shm_stats_event.timer_set) {
-        ngx_del_timer(&ngx_http_push_stream_shm_stats_event);
     }
 
     ngx_http_push_stream_clean_worker_data(data);
@@ -2230,30 +2194,6 @@ ngx_http_push_stream_buffer_timer_wake_handler(ngx_event_t *ev)
 {
     ngx_http_push_stream_buffer_cleanup();
     ngx_http_push_stream_timer_reset(NGX_HTTP_PUSH_STREAM_MESSAGE_BUFFER_CLEANUP_INTERVAL, &ngx_http_push_stream_buffer_cleanup_event);
-}
-
-/*
- * Fires every NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL (10 minutes) and
- * logs an INFO-level shared memory usage snapshot for each shared memory
- * zone this worker knows about - see ngx_http_push_stream_log_shm_stats()
- * for the log line format and the per-worker-duplication trade-off.
- */
-static void
-ngx_http_push_stream_shm_stats_timer_wake_handler(ngx_event_t *ev)
-{
-    ngx_http_push_stream_global_shm_data_t *global_data;
-    ngx_queue_t                            *q;
-
-    if (ngx_http_push_stream_global_shm_zone != NULL) {
-        global_data = (ngx_http_push_stream_global_shm_data_t *) ngx_http_push_stream_global_shm_zone->data;
-
-        for (q = ngx_queue_head(&global_data->shm_datas_queue); q != ngx_queue_sentinel(&global_data->shm_datas_queue); q = ngx_queue_next(q)) {
-            ngx_http_push_stream_shm_data_t *data = ngx_queue_data(q, ngx_http_push_stream_shm_data_t, shm_data_queue);
-            ngx_http_push_stream_log_shm_stats(data->shpool);
-        }
-    }
-
-    ngx_http_push_stream_timer_reset(NGX_HTTP_PUSH_STREAM_SHM_STATS_LOG_INTERVAL, &ngx_http_push_stream_shm_stats_event);
 }
 
 static ngx_str_t *

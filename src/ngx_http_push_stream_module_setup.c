@@ -374,9 +374,6 @@ ngx_http_push_stream_init_worker(ngx_cycle_t *cycle)
     // turn on timer to cleanup memory of old messages and channels
     ngx_http_push_stream_memory_cleanup_timer_set();
 
-    // turn on timer to periodically log a shared memory usage snapshot at INFO level
-    ngx_http_push_stream_shm_stats_timer_set();
-
     return ngx_http_push_stream_register_worker_message_handler(cycle);
 }
 

@@ -66,10 +66,24 @@ ngx_http_push_stream_send_response_all_channels_info_summarized(ngx_http_request
     ngx_http_push_stream_shm_data_t             *data = mcf->shm_data;
     ngx_http_push_stream_worker_data_t          *worker_data;
     ngx_http_push_stream_content_subtype_t      *subtype;
+    /* Shared memory zone usage snapshot (same rough free-page walk used by
+       ngx_http_push_stream_log_slab_alloc_failure() on the CRIT alloc-failure
+       path) - included here so it's visible on demand, from the same
+       endpoint as the rest of this module's stats, instead of a periodic
+       log line. */
+    ngx_uint_t                                   shm_free_pages;
+    size_t                                        shm_total_size;
+    size_t                                        shm_pagesize = ngx_pagesize;
+    size_t                                        shm_zone_total_mb;
+    size_t                                        shm_free_mb;
 
     subtype = ngx_http_push_stream_match_channel_info_format_and_content_type(r, 1);
     currenttime = ngx_http_push_stream_get_formatted_current_time(r->pool);
     hostname = ngx_http_push_stream_get_formatted_hostname(r->pool);
+
+    ngx_http_push_stream_shm_free_pages(mcf->shpool, &shm_total_size, &shm_free_pages);
+    shm_zone_total_mb = shm_total_size / (1024 * 1024);
+    shm_free_mb = (shm_free_pages * shm_pagesize) / (1024 * 1024);
 
     used_slots = 0;
     for(i = 0; i < NGX_MAX_PROCESSES; i++) {
@@ -95,14 +109,15 @@ ngx_http_push_stream_send_response_all_channels_info_summarized(ngx_http_request
     }
     *start = '\0';
 
-    len = 8*NGX_INT_T_LEN + subtype->format_summarized->len + hostname->len + currenttime->len + ngx_strlen(subscribers_by_workers) - 24;// minus 24 sprintf
+    // 9 original numeric counters + 4 new shm_* fields = 13; minus 24 sprintf (literal "%s"/"%ui" placeholder chars already counted via format_summarized->len)
+    len = 13*NGX_INT_T_LEN + subtype->format_summarized->len + hostname->len + currenttime->len + ngx_strlen(subscribers_by_workers) - 24;
 
     if ((text = ngx_http_push_stream_create_str(r->pool, len)) == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer.");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_sprintf(text->data, (char *) subtype->format_summarized->data, hostname->data, currenttime->data, data->channels, data->wildcard_channels, data->published_messages, data->stored_messages, data->messages_in_trash, data->channels_in_delete, data->channels_in_trash, data->subscribers, ngx_time() - data->startup, subscribers_by_workers);
+    ngx_sprintf(text->data, (char *) subtype->format_summarized->data, hostname->data, currenttime->data, data->channels, data->wildcard_channels, data->published_messages, data->stored_messages, data->messages_in_trash, data->channels_in_delete, data->channels_in_trash, data->subscribers, ngx_time() - data->startup, shm_zone_total_mb, shm_free_pages, shm_free_mb, shm_pagesize, subscribers_by_workers);
     text->len = ngx_strlen(text->data);
 
     return ngx_http_push_stream_send_response(r, text, subtype->content_type, NGX_HTTP_OK);
