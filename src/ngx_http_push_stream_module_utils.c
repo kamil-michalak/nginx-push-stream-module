@@ -702,10 +702,72 @@ ngx_http_push_stream_apply_text_template(ngx_str_t **dst_value, ngx_str_t **dst_
 
 #if (NGX_HAVE_ZLIB)
 /*
+ * Per-worker persistent deflate stream used to compress permessage-deflate
+ * frames on the publish path. server_no_context_takeover is negotiated, so
+ * the stream is RESET (deflateReset - cheap, no allocation) before every
+ * message rather than re-initialised, and still produces byte-identical
+ * output every call regardless of history - safe to cache in shared memory
+ * and fan out to every subscriber.
+ *
+ * Reusing one stream avoids the deflateInit2()/deflateEnd() workspace
+ * alloc+free (~256 KB with windowBits 15 / memLevel 8) that the publish path
+ * would otherwise pay on EVERY published message - and N times for a single
+ * wildcard fan-out publish - all while holding channel->mutex.
+ *
+ * nginx workers are separate processes, single-threaded on the event loop,
+ * so this file-scope pointer is naturally per-worker and needs no locking.
+ * ngx_http_push_stream_deflate_stream_cleanup() (called from
+ * ngx_http_push_stream_exit_worker) tears it down; a missed teardown just
+ * leaves the OS to reclaim it at process exit.
+ */
+static z_stream *ngx_http_push_stream_deflate_zs = NULL;
+
+static z_stream *
+ngx_http_push_stream_get_deflate_stream(void)
+{
+    if (ngx_http_push_stream_deflate_zs != NULL) {
+        if (deflateReset(ngx_http_push_stream_deflate_zs) == Z_OK) {
+            return ngx_http_push_stream_deflate_zs;
+        }
+        /* reset failed (should never happen) - drop it and rebuild below */
+        deflateEnd(ngx_http_push_stream_deflate_zs);
+        ngx_free(ngx_http_push_stream_deflate_zs);
+        ngx_http_push_stream_deflate_zs = NULL;
+    }
+
+    ngx_http_push_stream_deflate_zs = ngx_alloc(sizeof(z_stream), ngx_cycle->log);
+    if (ngx_http_push_stream_deflate_zs == NULL) {
+        return NULL;
+    }
+    ngx_memzero(ngx_http_push_stream_deflate_zs, sizeof(z_stream));
+
+    /* windowBits = -15: raw deflate, no zlib header or trailer (RFC 7692) */
+    if (deflateInit2(ngx_http_push_stream_deflate_zs, Z_DEFAULT_COMPRESSION,
+                     Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        ngx_free(ngx_http_push_stream_deflate_zs);
+        ngx_http_push_stream_deflate_zs = NULL;
+        return NULL;
+    }
+
+    return ngx_http_push_stream_deflate_zs;
+}
+
+void
+ngx_http_push_stream_deflate_stream_cleanup(void)
+{
+    if (ngx_http_push_stream_deflate_zs != NULL) {
+        deflateEnd(ngx_http_push_stream_deflate_zs);
+        ngx_free(ngx_http_push_stream_deflate_zs);
+        ngx_http_push_stream_deflate_zs = NULL;
+    }
+}
+
+/*
  * Compress plain WebSocket payload with raw deflate (RFC 7692 permessage-deflate).
- * Uses server_no_context_takeover: z_stream is init/reset per message so the
- * resulting bytes are identical every call - safe to cache in shared memory and
- * send to many subscribers without per-connection state.
+ * Uses server_no_context_takeover (see ngx_http_push_stream_get_deflate_stream):
+ * the shared per-worker z_stream is reset per message so the resulting bytes
+ * are identical every call - safe to cache in shared memory and send to many
+ * subscribers without per-connection state.
  *
  * Returns a fully framed ngx_str_t (opcode 0xC1 + length + deflated payload)
  * allocated from temp_pool, or NULL when:
@@ -717,11 +779,11 @@ static ngx_str_t *
 ngx_http_push_stream_deflate_websocket_frame(const u_char *payload, off_t payload_len,
     ngx_pool_t *temp_pool)
 {
-    uLong     bound;
-    u_char   *deflated;
-    z_stream  zs;
-    int       ret;
-    uLong     compressed_len;
+    uLong      bound;
+    u_char    *deflated;
+    z_stream  *zs;
+    int        ret;
+    uLong      compressed_len;
 
     if (payload_len < NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN) {
         return NULL;
@@ -732,26 +794,23 @@ ngx_http_push_stream_deflate_websocket_frame(const u_char *payload, off_t payloa
         return NULL;
     }
 
-    ngx_memzero(&zs, sizeof(z_stream));
-    /* windowBits = -15: raw deflate, no zlib header or trailer */
-    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
-                     Z_DEFAULT_STRATEGY) != Z_OK) {
+    if ((zs = ngx_http_push_stream_get_deflate_stream()) == NULL) {
         return NULL;
     }
 
-    zs.next_in  = (Bytef *) payload;
-    zs.avail_in = (uInt) payload_len;
-    zs.next_out = deflated;
-    zs.avail_out = (uInt) bound;
+    zs->next_in   = (Bytef *) payload;
+    zs->avail_in  = (uInt) payload_len;
+    zs->next_out  = deflated;
+    zs->avail_out = (uInt) bound;
 
-    ret = deflate(&zs, Z_SYNC_FLUSH);
-    deflateEnd(&zs);
+    /* NO deflateEnd here - the stream is reused; the next call resets it */
+    ret = deflate(zs, Z_SYNC_FLUSH);
 
     if (ret != Z_OK && ret != Z_BUF_ERROR) {
         return NULL;
     }
 
-    compressed_len = bound - zs.avail_out;
+    compressed_len = bound - zs->avail_out;
 
     /* RFC 7692 s.7.2.1: remove trailing 00 00 FF FF added by Z_SYNC_FLUSH */
     if (compressed_len >= 4
@@ -929,8 +988,12 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
         }
 
 #if (NGX_HAVE_ZLIB)
-        /* for websocket templates, also try to build a compressed frame */
-        if (cur->websocket) {
+        /* for websocket templates whose location(s) enabled permessage-deflate,
+           also build and cache a compressed frame - skipped entirely when
+           push_stream_websocket_permessage_deflate is off everywhere that uses
+           this template, so those setups pay no publish-time compression cost
+           and store no second copy in shared memory */
+        if (cur->websocket && cur->websocket_permessage_deflate) {
             ngx_str_t *compressed = ngx_http_push_stream_deflate_websocket_frame(
                 aux->data, aux->len, temp_pool);
             if (compressed != NULL) {

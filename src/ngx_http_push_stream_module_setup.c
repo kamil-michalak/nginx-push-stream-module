@@ -262,6 +262,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, websocket_max_message_length),
         NULL },
+    { ngx_string("push_stream_websocket_permessage_deflate"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_flag_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, websocket_permessage_deflate),
+        NULL },
     { ngx_string("push_stream_unknown_event_id_behavior"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_enum_slot,
@@ -411,6 +417,10 @@ ngx_http_push_stream_exit_worker(ngx_cycle_t *cycle)
     ngx_http_push_stream_cleanup_shutting_down_worker();
 
     ngx_http_push_stream_ipc_exit_worker(cycle);
+
+#if (NGX_HAVE_ZLIB)
+    ngx_http_push_stream_deflate_stream_cleanup();
+#endif
 }
 
 
@@ -672,6 +682,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->websocket_allow_resubscribe = NGX_CONF_UNSET_UINT;
     lcf->websocket_max_channels_per_connection = NGX_CONF_UNSET_UINT;
     lcf->websocket_max_message_length = NGX_CONF_UNSET_SIZE;
+    lcf->websocket_permessage_deflate = NGX_CONF_UNSET;
     lcf->unknown_event_id_behavior = NGX_CONF_UNSET_UINT;
     lcf->channel_info_on_publish = NGX_CONF_UNSET_UINT;
     lcf->allow_connections_to_events_channel = NGX_CONF_UNSET_UINT;
@@ -710,6 +721,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->websocket_allow_resubscribe, prev->websocket_allow_resubscribe, 0);
     ngx_conf_merge_uint_value(conf->websocket_max_channels_per_connection, prev->websocket_max_channels_per_connection, NGX_CONF_UNSET_UINT);
     ngx_conf_merge_size_value(conf->websocket_max_message_length, prev->websocket_max_message_length, NGX_HTTP_PUSH_STREAM_DEFAULT_WEBSOCKET_MAX_MESSAGE_LENGTH);
+    ngx_conf_merge_value(conf->websocket_permessage_deflate, prev->websocket_permessage_deflate, 1);
     ngx_conf_merge_uint_value(conf->unknown_event_id_behavior, prev->unknown_event_id_behavior, NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE);
     ngx_conf_merge_value(conf->channel_info_on_publish, prev->channel_info_on_publish, 1);
     ngx_conf_merge_value(conf->allow_connections_to_events_channel, prev->allow_connections_to_events_channel, 0);
@@ -867,7 +879,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_STREAMING) ||
         (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE) ||
         (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET)) {
-        if ((conf->message_template_index = ngx_http_push_stream_find_or_add_template(cf, conf->message_template, (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE), (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET))) < 0) {
+        if ((conf->message_template_index = ngx_http_push_stream_find_or_add_template(cf, conf->message_template, (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_EVENTSOURCE), (conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET), ((conf->location_type == NGX_HTTP_PUSH_STREAM_SUBSCRIBER_MODE_WEBSOCKET) && conf->websocket_permessage_deflate))) < 0) {
             ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "push stream module: push stream module: unable to parse message template: %V", &conf->message_template);
             return NGX_CONF_ERROR;
         }

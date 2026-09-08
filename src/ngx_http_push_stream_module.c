@@ -325,7 +325,7 @@ ngx_http_push_stream_check_and_parse_template_pattern(ngx_conf_t *cf, ngx_http_p
 }
 
 static ngx_int_t
-ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ngx_flag_t eventsource, ngx_flag_t websocket)
+ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ngx_flag_t eventsource, ngx_flag_t websocket, ngx_flag_t websocket_permessage_deflate)
 {
     ngx_http_push_stream_main_conf_t      *mcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_push_stream_module);
     ngx_queue_t                           *q;
@@ -340,6 +340,12 @@ ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ng
         cur = ngx_queue_data(q, ngx_http_push_stream_template_t, queue);
         if ((ngx_memn2cmp(cur->template->data, template.data, cur->template->len, template.len) == 0) &&
             (cur->eventsource == eventsource) && (cur->websocket == websocket)) {
+            /* two websocket locations can share one template with different
+               permessage-deflate settings - build the compressed copy if ANY
+               of them wants it (a location with it off never reads the copy) */
+            if (websocket_permessage_deflate) {
+                cur->websocket_permessage_deflate = 1;
+            }
             return cur->index;
         }
     }
@@ -355,6 +361,7 @@ ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ng
     cur->template = aux;
     cur->eventsource = eventsource;
     cur->websocket = websocket;
+    cur->websocket_permessage_deflate = websocket_permessage_deflate;
     cur->index = mcf->qtd_templates;
     cur->qtd_message_id = 0;
     cur->qtd_event_id = 0;

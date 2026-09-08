@@ -94,6 +94,10 @@ typedef struct {
     ngx_uint_t                      index;
     ngx_flag_t                      eventsource;
     ngx_flag_t                      websocket;
+    ngx_flag_t                      websocket_permessage_deflate;  /* build the cached compressed frame for this
+                                                                      template: set when at least one websocket
+                                                                      location using it has
+                                                                      push_stream_websocket_permessage_deflate on */
     ngx_queue_t                     parts;
     ngx_uint_t                      qtd_message_id;
     ngx_uint_t                      qtd_event_id;
@@ -247,6 +251,10 @@ typedef struct {
     ngx_uint_t                      websocket_max_channels_per_connection;
     size_t                          websocket_max_message_length;  /* max bytes of one inbound WS message; see
                                                                       NGX_HTTP_PUSH_STREAM_DEFAULT_WEBSOCKET_MAX_MESSAGE_LENGTH */
+    ngx_flag_t                      websocket_permessage_deflate;  /* negotiate permessage-deflate with WS clients AND
+                                                                      build the cached compressed frame at publish time;
+                                                                      off => neither (no double copy in shm, no publish
+                                                                      CPU). Default on. */
     ngx_uint_t                      unknown_event_id_behavior;
     ngx_flag_t                      channel_info_on_publish;
     ngx_flag_t                      allow_connections_to_events_channel;
@@ -530,7 +538,7 @@ static ngx_int_t        ngx_http_push_stream_send_response_all_channels_info_sum
 static ngx_int_t        ngx_http_push_stream_send_response_all_channels_info_detailed(ngx_http_request_t *r, ngx_str_t *prefix);
 static ngx_int_t        ngx_http_push_stream_send_response_channels_info_detailed(ngx_http_request_t *r, ngx_http_push_stream_requested_channel_t *requested_channels);
 
-static ngx_int_t        ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ngx_flag_t eventsource, ngx_flag_t websocket);
+static ngx_int_t        ngx_http_push_stream_find_or_add_template(ngx_conf_t *cf, ngx_str_t template, ngx_flag_t eventsource, ngx_flag_t websocket, ngx_flag_t websocket_permessage_deflate);
 
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALL_CHANNELS_INFO_ID = ngx_string("ALL");
 

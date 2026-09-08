@@ -117,7 +117,26 @@ częstej aktualizacji snapshotu. Ten sam mechanizm dotyczy
 `workers_ref_count` i odraczać `free` jak dla wiadomości z kolejki, albo trzymać
 poprzedni snapshot w "trash" z TTL zamiast natychmiastowego `free`.
 
-### 🟠 3. CPU publikacji — `deflateInit2`/`deflateEnd` per wiadomość per kanał
+### 🟠 3. CPU publikacji — `deflateInit2`/`deflateEnd` per wiadomość per kanał  ✅ NAPRAWIONE (branch `test23`)
+
+> **Fix zaaplikowany 2026-09-08:**
+> - **`deflateReset()` per worker** — jeden trwały `z_stream` na proces workera
+>   (`ngx_http_push_stream_deflate_zs` w `utils.c`), resetowany przed każdą
+>   wiadomością zamiast `deflateInit2`/`deflateEnd`. Znika ~256 KB alloc+free
+>   na każdą publikowaną wiadomość (i N× przy fan-oucie wildcard). Sprzątany w
+>   `ngx_http_push_stream_exit_worker`. Workery to osobne procesy jednowątkowe
+>   na event-loopie → brak locka.
+> - **Nowa dyrektywa `push_stream_websocket_permessage_deflate on|off`**
+>   (per location, domyślnie `on`). `off` = (1) handshake WS nie negocjuje
+>   `permessage-deflate` (`ctx->deflate_enabled` zostaje 0, brak nagłówka
+>   odpowiedzi) **i** (2) `convert_char_to_msg_on_shared` **nie buduje** kopii
+>   skompresowanej — zero kosztu CPU przy publikacji i **brak drugiej kopii w
+>   shm**. Flaga jest per-szablon (`template->websocket_permessage_deflate`),
+>   OR-owana po wszystkich lokacjach WS używających danego szablonu — jeśli
+>   choć jedna chce deflate, kopia powstaje.
+> - Kompiluje się czysto (nginx 1.26.2, z/bez `NGX_HAVE_ZLIB`, `-Wall`).
+>
+> Opis poniżej dla kontekstu.
 
 `ngx_http_push_stream_deflate_websocket_frame()` woła `deflateInit2()` +
 `deflateEnd()` **na każdą wiadomość** w `convert_char_to_msg_on_shared`. Każdy
@@ -277,7 +296,10 @@ komunikaty (batch subscribe, duży payload aplikacyjny).
 **Fix:** pętla `inflate` z realokacją przy `avail_out == 0` + twardy limit; „bufor
 pełny, a nie `Z_STREAM_END`” traktować jako błąd, nie sukces.
 
-### 🟠 10. `deflate` bezwarunkowy i bez przełącznika konfiguracyjnego
+### 🟠 10. `deflate` bezwarunkowy i bez przełącznika konfiguracyjnego  ✅ NAPRAWIONE (branch `test23`)
+
+> **Fix:** dyrektywa `push_stream_websocket_permessage_deflate on|off` (patrz
+> ramka przy #3). `off` wyłącza negocjację handshake **i** budowę kopii w shm.
 
 Rozszerzenie #3: `deflate_websocket_frame()` jest wołane przy **każdej** publikacji
 gdy istnieje szablon `websocket` i payload ≥ 200 B — niezależnie od tego, czy

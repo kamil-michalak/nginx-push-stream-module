@@ -332,9 +332,10 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     }
 
 #if (NGX_HAVE_ZLIB)
-    /* detect permessage-deflate offer from client */
+    /* accept the client's permessage-deflate offer only when this location
+       has it enabled (push_stream_websocket_permessage_deflate, default on) */
     ctx->deflate_enabled = 0;
-    {
+    if (cf->websocket_permessage_deflate) {
         ngx_str_t *ext_header = ngx_http_push_stream_get_header(r, (ngx_str_t *) &NGX_HTTP_PUSH_STREAM_HEADER_SEC_WEBSOCKET_EXTENSIONS);
         if (ext_header != NULL &&
             ngx_strnstr(ext_header->data, "permessage-deflate", ext_header->len) != NULL) {
