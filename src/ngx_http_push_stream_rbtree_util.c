@@ -145,6 +145,7 @@ ngx_http_push_stream_get_channel(ngx_str_t *id, ngx_log_t *log, ngx_http_push_st
 
     channel->wildcard = is_wildcard_channel;
     channel->channel_deleted_message = NULL;
+    channel->startup_message = NULL;
     channel->last_message_id = 0;
     channel->last_message_time = 0;
     channel->last_message_tag = 0;

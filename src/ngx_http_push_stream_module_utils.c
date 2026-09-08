@@ -1333,6 +1333,35 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
 }
 
 
+/*
+ * Atomically replace (new_msg != NULL) or clear (new_msg == NULL) a channel's
+ * startup message, freeing the previous one. The swap is done under
+ * channel->mutex so a concurrent ngx_http_push_stream_send_startup_message()
+ * on any worker either sees the old message (and finishes sending it before
+ * we free) or the new one - never a dangling pointer. The actual free happens
+ * after the lock is dropped: once the pointer is swapped, no new reader can
+ * reach the old message.
+ */
+void
+ngx_http_push_stream_set_channel_startup_message(ngx_http_push_stream_main_conf_t *mcf, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *new_msg)
+{
+    ngx_http_push_stream_msg_t            *old_msg;
+
+    if (channel == NULL) {
+        return;
+    }
+
+    ngx_shmtx_lock(channel->mutex);
+    old_msg = channel->startup_message;
+    channel->startup_message = new_msg;
+    ngx_shmtx_unlock(channel->mutex);
+
+    if (old_msg != NULL) {
+        ngx_http_push_stream_free_message_memory(mcf->shpool, old_msg);
+    }
+}
+
+
 ngx_chain_t *
 ngx_http_push_stream_get_buf(ngx_http_request_t *r)
 {
@@ -1899,6 +1928,7 @@ nxg_http_push_stream_free_channel_memory(ngx_slab_pool_t *shpool, ngx_http_push_
     ngx_shmtx_t                          *mutex = channel->mutex;
 
     if (channel->channel_deleted_message != NULL) ngx_http_push_stream_free_message_memory(shpool, channel->channel_deleted_message);
+    if (channel->startup_message != NULL) ngx_http_push_stream_free_message_memory(shpool, channel->startup_message);
     ngx_shmtx_lock(mutex);
     while (!ngx_queue_empty(&channel->workers_with_subscribers)) {
         cur = ngx_queue_head(&channel->workers_with_subscribers);

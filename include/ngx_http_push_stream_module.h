@@ -343,6 +343,19 @@ struct ngx_http_push_stream_channel_s {
     ngx_flag_t                          wildcard;
     char                                for_events;
     ngx_http_push_stream_msg_t         *channel_deleted_message;
+    /* Optional per-channel "startup" message, set via a publish carrying the
+       Startup-Message header (NGX_HTTP_PUSH_STREAM_HEADER_STARTUP_MESSAGE).
+       Delivered - ahead of any live message - to every subscriber that joins
+       the channel WITHOUT requesting history (no Last-Event-Id, no
+       If-Modified-Since, no backtrack). It is not stored in message_queue and
+       is not broadcast to already-connected subscribers. Lives here (shared
+       memory, on the channel struct that survives "nginx -s reload") like
+       message_ttl / channel_deleted_message; its eagerly-formatted copies are
+       from the config generation that set it (same caveat as
+       channel_deleted_message). Replaced or cleared by a later
+       Startup-Message publish (empty body clears). Freed here on replace and
+       in nxg_http_push_stream_free_channel_memory(). */
+    ngx_http_push_stream_msg_t         *startup_message;
     ngx_shmtx_t                        *mutex;
 };
 
@@ -509,6 +522,8 @@ static const ngx_str_t NGX_HTTP_PUSH_STREAM_SUBSCRIPTION_EVENTS_CHANNEL_FORBIDDE
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_NO_MANDATORY_HEADERS_MESSAGE = ngx_string("Don't have at least one of the mandatory headers: Connection, Upgrade, Sec-WebSocket-Key and Sec-WebSocket-Version");
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_WRONG_WEBSOCKET_VERSION_MESSAGE = ngx_string("Version not supported. Supported versions: 8, 13");
 static const ngx_str_t NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED = ngx_string("Channel deleted.");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_SET = ngx_string("Startup message set.");
+static const ngx_str_t NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_CLEARED = ngx_string("Startup message cleared.");
 
 #define NGX_HTTP_PUSH_STREAM_UNSET_CHANNEL_ID               (void *) -1
 #define NGX_HTTP_PUSH_STREAM_TOO_LARGE_CHANNEL_ID           (void *) -2
@@ -531,6 +546,12 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE = ngx_string("Eve
    change (or first set) that channel's TTL. See
    ngx_http_push_stream_add_msg_to_channel(). */
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL = ngx_string("Message-TTL");
+/* Optional publish header. When present on a POST/PUT to a publisher
+   location, the request body is stored as the target channel(s)' startup
+   message (see ngx_http_push_stream_channel_s.startup_message) instead of
+   being appended to the message buffer / broadcast. An empty body clears it.
+   The Event-Id / Event-Type headers, if given, apply to the startup message. */
+static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_STARTUP_MESSAGE = ngx_string("Startup-Message");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_LAST_EVENT_ID = ngx_string("Last-Event-Id");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_ALLOW = ngx_string("Allow");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EXPLAIN = ngx_string("X-Nginx-PushStream-Explain");
@@ -646,7 +667,7 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOW_GET_POST_PUT_DELETE_METHODS =
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOW_GET_POST_PUT_METHODS = ngx_string("GET, POST, PUT");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOW_GET = ngx_string("GET");
 
-static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOWED_HEADERS = ngx_string("If-Modified-Since,If-None-Match,Etag,Event-Id,Event-Type,Last-Event-Id");
+static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOWED_HEADERS = ngx_string("If-Modified-Since,If-None-Match,Etag,Event-Id,Event-Type,Last-Event-Id,Startup-Message,Message-TTL");
 
 #define NGX_HTTP_PUSH_STREAM_CHECK_AND_FINALIZE_REQUEST_ON_ERROR(val, fail, r, errormessage) \
     if (val == fail) {                                                       \

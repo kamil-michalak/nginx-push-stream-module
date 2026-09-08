@@ -32,6 +32,7 @@ static ngx_http_push_stream_subscriber_t        *ngx_http_push_stream_subscriber
 static ngx_int_t                                 ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_stream_subscriber_t *worker_subscriber);
 static ngx_uint_t                                ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id);
 static void                                      ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id);
+static ngx_flag_t                                ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel);
 static ngx_http_push_stream_pid_queue_t         *ngx_http_push_stream_get_worker_subscriber_channel_sentinel_locked(ngx_slab_pool_t *shpool, ngx_http_push_stream_channel_t *channel, ngx_log_t *log);
 static ngx_http_push_stream_subscription_t      *ngx_http_push_stream_create_channel_subscription(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_subscriber_t *subscriber);
 static ngx_int_t                                 ngx_http_push_stream_assing_subscription_to_channel(ngx_slab_pool_t *shpool, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_subscription_t *subscription, ngx_queue_t *subscriptions, ngx_log_t *log);
@@ -298,6 +299,34 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
             }
         }
 
+        /* a fresh poll (no history requested for this channel) with a startup
+           message pending counts as "has something to send" - so the request
+           isn't answered with 304 and a longpoll doesn't park waiting.
+           ngx_http_push_stream_send_startup_message() will send the snapshot
+           plus every buffered message after it, so the poll's Last-Modified /
+           Etag must point at the channel's newest message (or, on a channel
+           with nothing buffered yet, "now") so the client's next poll resumes
+           from there instead of re-fetching the snapshot every time. */
+        if ((ch_event_id == NULL) && (if_modified_since < 0)
+            && (requested_channel->backtrack_messages == 0)
+            && (requested_channel->channel != NULL)
+            && (requested_channel->channel->startup_message != NULL)) {
+            time_t     resume_time = requested_channel->channel->last_message_time;
+            ngx_int_t  resume_tag  = requested_channel->channel->last_message_tag;
+
+            has_message_to_send = 1;
+            if (resume_time == 0) {
+                resume_time = ngx_time();
+                resume_tag  = 0;
+            }
+            if (resume_time > greater_message_time) {
+                greater_message_time = resume_time;
+                greater_message_tag  = resume_tag;
+            } else if ((resume_time == greater_message_time) && (resume_tag > greater_message_tag)) {
+                greater_message_tag = resume_tag;
+            }
+        }
+
         channel_index++;
     }
 
@@ -356,8 +385,17 @@ ngx_http_push_stream_subscriber_polling_handler(ngx_http_request_t *r, ngx_http_
     // Reset index for second pass (send loop) over the same channel list
     channel_index = 0;
     for (q = ngx_queue_head(&requested_channels->queue); q != ngx_queue_sentinel(&requested_channels->queue); q = ngx_queue_next(q)) {
+        ngx_str_t *ch_event_id;
+
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
-        ngx_http_push_stream_send_old_messages(r, requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++));
+        ch_event_id = ngx_http_push_stream_get_event_id_by_index(event_id_parts, channel_index++);
+
+        /* fresh poll for this channel - replay its startup message first */
+        if ((ch_event_id == NULL) && (if_modified_since < 0) && (requested_channel->backtrack_messages == 0)) {
+            ngx_http_push_stream_send_startup_message(r, requested_channel->channel);
+        }
+
+        ngx_http_push_stream_send_old_messages(r, requested_channel->channel, requested_channel->backtrack_messages, if_modified_since, tag, greater_message_time, greater_message_tag, ch_event_id);
     }
 
     if (ctx->callback != NULL) {
@@ -427,6 +465,13 @@ ngx_http_push_stream_subscriber_assign_channel(ngx_http_push_stream_main_conf_t 
     if (old_msg_status == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
         ngx_http_push_stream_send_old_messages(r, requested_channel->channel,
             requested_channel->backtrack_messages, if_modified_since, tag, 0, -1, last_event_id);
+    }
+
+    /* fresh subscription - no history requested (no Last-Event-Id, no
+       If-Modified-Since, no backtrack) - so replay the channel's startup
+       message, if any, before the subscription starts receiving live messages */
+    if ((last_event_id == NULL) && (if_modified_since < 0) && (requested_channel->backtrack_messages == 0)) {
+        ngx_http_push_stream_send_startup_message(r, requested_channel->channel);
     }
 
     return ngx_http_push_stream_assing_subscription_to_channel(shpool, requested_channel->channel, subscription, &subscriber->subscriptions, r->connection->log);
@@ -727,6 +772,80 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
             ngx_shmtx_unlock(channel->mutex);
         }
     }
+}
+
+
+/*
+ * Deliver a channel's startup message (if any) to a subscriber joining WITHOUT
+ * requesting history, then replay the buffered messages that follow it - so
+ * the client gets: snapshot + catch-up + live, with no gap and without having
+ * to send a Last-Event-Id.
+ *
+ * The catch-up boundary is, in order of preference:
+ *
+ *   1. the startup message's own Event-Id (when the publisher set one). It is
+ *      matched against the buffer exactly like a client-supplied Last-Event-Id:
+ *      every message AFTER the one carrying that id is replayed. This is
+ *      deterministic even while many publishers write concurrently - the
+ *      publisher names the exact cut point ("this snapshot is current as of
+ *      message X"), rather than relying on a wall-clock instant. If that id is
+ *      no longer in the buffer (rotated out / never existed), nothing is
+ *      replayed - snapshot + live only, same as a stale Last-Event-Id.
+ *
+ *   2. otherwise, the channel stream position (last_message_time /
+ *      last_message_tag) captured into the startup message's time/tag fields
+ *      when it was set (see ngx_http_push_stream_publisher_body_handler).
+ *      (0, 0) - startup message set on an empty channel - replays the whole
+ *      buffer, which is correct: the snapshot predates every message.
+ *
+ * The snapshot send is done under channel->mutex (like send_old_messages),
+ * which also serializes it against ngx_http_push_stream_set_channel_startup_message()
+ * swapping/freeing the message from another worker. Everything the follow-up
+ * replay needs (boundary event-id copied into the request pool, or the
+ * time/tag pair) is taken before the lock is dropped, so that replay - which
+ * re-locks channel->mutex itself - is unaffected by a concurrent replace.
+ *
+ * Returns 1 if a startup message was sent, 0 otherwise.
+ */
+static ngx_flag_t
+ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel)
+{
+    ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+    ngx_str_t                             *boundary_event_id = NULL;
+    time_t                                 since_time = -1;
+    ngx_int_t                              since_tag = -1;
+
+    if ((channel == NULL) || (channel->startup_message == NULL)) {
+        return 0;
+    }
+
+    ngx_shmtx_lock(channel->mutex);
+    if ((channel->startup_message == NULL) || channel->startup_message->deleted) {
+        ngx_shmtx_unlock(channel->mutex);
+        return 0;
+    }
+    since_time = channel->startup_message->time;
+    since_tag  = channel->startup_message->tag;
+    if (channel->startup_message->event_id != NULL) {
+        /* copy it out of shared memory - the startup message (and this id with
+           it) may be freed by a concurrent replace once the lock is dropped */
+        boundary_event_id = ngx_http_push_stream_create_str(r->pool, channel->startup_message->event_id->len);
+        if (boundary_event_id != NULL) {
+            ngx_memcpy(boundary_event_id->data, channel->startup_message->event_id->data, channel->startup_message->event_id->len);
+        }
+    }
+    ngx_http_push_stream_send_response_message(r, channel, channel->startup_message, 0, ctx->message_sent);
+    ngx_shmtx_unlock(channel->mutex);
+
+    /* replay the buffer from the boundary: the snapshot's Event-Id if it has
+       one, otherwise the stream position captured when it was set */
+    if (boundary_event_id != NULL) {
+        ngx_http_push_stream_send_old_messages(r, channel, 0, -1, -1, 0, -1, boundary_event_id);
+    } else {
+        ngx_http_push_stream_send_old_messages(r, channel, 0, since_time, since_tag, 0, -1, NULL);
+    }
+
+    return 1;
 }
 
 static ngx_http_push_stream_pid_queue_t *

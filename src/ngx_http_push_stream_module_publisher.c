@@ -247,7 +247,7 @@ ngx_http_push_stream_publisher_delete_handler(ngx_http_request_t *r)
 static void
 ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 {
-    ngx_str_t                              *event_id, *event_type, *message_ttl_header;
+    ngx_str_t                              *event_id, *event_type, *message_ttl_header, *startup_message_header;
     ngx_http_push_stream_module_ctx_t      *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_main_conf_t       *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_loc_conf_t        *cf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
@@ -256,6 +256,20 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 
     ngx_http_push_stream_requested_channel_t       *requested_channel;
     ngx_queue_t                                    *q;
+
+    startup_message_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_STARTUP_MESSAGE);
+
+    /* A publish carrying the Startup-Message header with an EMPTY body clears
+       the target channel(s)' startup message. Handled before the generic
+       empty-body rejection below. */
+    if ((startup_message_header != NULL) && (r->headers_in.content_length_n <= 0)) {
+        for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
+            requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
+            ngx_http_push_stream_set_channel_startup_message(mcf, requested_channel->channel, NULL);
+        }
+        ngx_http_push_stream_send_only_header_response_and_finalize(r, NGX_HTTP_OK, &NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_CLEARED);
+        return;
+    }
 
     // check if body message wasn't empty
     if (r->headers_in.content_length_n <= 0) {
@@ -275,6 +289,53 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     event_id = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_ID);
     event_type = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE);
     message_ttl_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL);
+
+    /* A publish carrying the Startup-Message header with a non-empty body
+       stores that body as the target channel(s)' startup message: it is NOT
+       appended to the message buffer and NOT broadcast to current
+       subscribers - only replayed to future subscribers that connect without
+       requesting history. Event-Id / Event-Type, if present, apply to it. */
+    if (startup_message_header != NULL) {
+        for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
+            ngx_http_push_stream_msg_t *startup_msg;
+            time_t                      since_time;
+            ngx_int_t                   since_tag;
+
+            requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
+            if (requested_channel->channel == NULL) {
+                continue;
+            }
+
+            /* stamp the startup message with the channel's current stream
+               position - it becomes the "replay from here" boundary for
+               subscribers that later connect without a Last-Event-Id, so they
+               get snapshot + everything buffered after it. (0, 0) on an empty
+               channel => the whole buffer is replayed, which is correct. */
+            ngx_shmtx_lock(requested_channel->channel->mutex);
+            since_time = requested_channel->channel->last_message_time;
+            since_tag  = requested_channel->channel->last_message_tag;
+            ngx_shmtx_unlock(requested_channel->channel->mutex);
+
+            startup_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, buf->pos, ngx_buf_size(buf),
+                requested_channel->channel, NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_ID,
+                event_id, event_type, since_time, since_tag, r->pool, NULL);
+            if (startup_msg == NULL) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate startup message in shared memory");
+                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            ngx_http_push_stream_set_channel_startup_message(mcf, requested_channel->channel, startup_msg);
+        }
+
+        if (cf->channel_info_on_publish) {
+            ngx_http_push_stream_send_response_channels_info_detailed(r, ctx->requested_channels);
+            ngx_http_finalize_request(r, NGX_OK);
+        } else {
+            ngx_http_push_stream_send_only_header_response_and_finalize(r, NGX_HTTP_OK, &NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_SET);
+        }
+        return;
+    }
 
     /* A single publish can target many channels at once
        (push_stream_channels_path with a comma-separated list, or a wildcard

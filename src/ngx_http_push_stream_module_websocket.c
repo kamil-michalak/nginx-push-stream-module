@@ -226,6 +226,10 @@ ngx_http_push_stream_websocket_handle_subscribe(ngx_http_request_t *r,
                 }
             }
         }
+    } else {
+        /* no event_id given - replay the channel's startup message, if any,
+           the same way an initial subscription without Last-Event-Id does */
+        ngx_http_push_stream_send_startup_message(r, channel);
     }
 }
 
