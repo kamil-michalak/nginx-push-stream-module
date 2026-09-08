@@ -546,11 +546,12 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE = ngx_string("Eve
    change (or first set) that channel's TTL. See
    ngx_http_push_stream_add_msg_to_channel(). */
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL = ngx_string("Message-TTL");
-/* Optional publish header. When present on a POST/PUT to a publisher
-   location, the request body is stored as the target channel(s)' startup
+/* Optional boolean publish header. Only the exact value "1" on a POST/PUT to a
+   publisher location stores the request body as the target channel(s)' startup
    message (see ngx_http_push_stream_channel_s.startup_message) instead of
-   being appended to the message buffer / broadcast. An empty body clears it.
-   The Event-Id / Event-Type headers, if given, apply to the startup message. */
+   appending it to the message buffer / broadcasting it; an empty body then
+   clears it. "0", an empty value, or no header => an ordinary publish. The
+   Event-Id / Event-Type headers, if given, apply to the startup message. */
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_STARTUP_MESSAGE = ngx_string("Startup-Message");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_LAST_EVENT_ID = ngx_string("Last-Event-Id");
 static const ngx_str_t  NGX_HTTP_PUSH_STREAM_HEADER_ALLOW = ngx_string("Allow");

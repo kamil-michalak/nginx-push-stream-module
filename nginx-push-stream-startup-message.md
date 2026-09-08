@@ -87,19 +87,21 @@ Content-Type: application/json
 {"type":"snapshot","score":"1:0","minute":37, ...}
 ```
 
-- Naglowek `Startup-Message` obecny + **niepuste** cialo → cialo zostaje
-  zapisane jako wiadomosc startowa kanalu (nadpisuje poprzednia, przesuwa
-  granice catch-up).
-- Naglowek `Startup-Message` obecny + **puste** cialo → wiadomosc startowa
-  kanalu zostaje wyczyszczona.
+- Naglowek to **boolean** — tylko dokladna wartosc **`1`** wlacza tryb
+  „wiadomosc startowa". `Startup-Message: 0`, pusta wartosc lub brak naglowka →
+  **zwykla publikacja** (cialo do bufora + broadcast), dokladnie jak bez tej
+  funkcji. Dzieki temu klient moze zawsze wysylac `Startup-Message: 0` na
+  zwyklych publikacjach.
+- `Startup-Message: 1` + **niepuste** cialo → cialo zostaje zapisane jako
+  wiadomosc startowa kanalu (nadpisuje poprzednia, przesuwa granice catch-up).
+- `Startup-Message: 1` + **puste** cialo → wiadomosc startowa kanalu zostaje
+  wyczyszczona.
 - `Event-Id` / `Event-Type`, jesli podane, dotycza wiadomosci startowej
   (formatowane w szablonie tak samo jak przy zwyklej publikacji). `Event-Id`
   pelni dodatkowo role granicy catch-up — patrz „Granica catch-up" wyzej.
 - Dziala z lista kanalow (`id=a,b,c`) i z kanalem wildcard — kazdy wskazany
   kanal dostaje wlasna kopie. **Nie** dziala z `id=ALL` ani z `*` w id
   (odrzucane tak samo jak przy zwyklej publikacji).
-- Wartosc naglowka jest ignorowana — liczy sie sama obecnosc. Konwencjonalnie
-  `Startup-Message: 1`.
 
 ### Odpowiedzi
 
@@ -240,12 +242,14 @@ ws.onmessage = (e) => {
 
 `ngx_http_push_stream_publisher_body_handler()`:
 
-1. odczyt naglowka `Startup-Message` (`ngx_http_push_stream_get_header`).
-2. **puste cialo** → dla kazdego wskazanego kanalu
+1. odczyt naglowka `Startup-Message` — `is_startup_message` = obecny **i**
+   `len == 1 && data[0] == '1'`. Wpp (brak / `0` / puste / inna wartosc) →
+   pomijamy caly ten blok, leci zwykla publikacja.
+2. `is_startup_message` + **puste cialo** → dla kazdego wskazanego kanalu
    `ngx_http_push_stream_set_channel_startup_message(mcf, channel, NULL)` →
    `200` `Startup message cleared.` — **return** (przed generyczna walidacja
    pustego body).
-3. **niepuste cialo** → po odczycie body i naglowkow `Event-Id` / `Event-Type`,
+3. `is_startup_message` + **niepuste cialo** → po odczycie body i naglowkow `Event-Id` / `Event-Type`,
    dla kazdego kanalu:
    - pod `channel->mutex` odczyt `last_message_time` / `last_message_tag`
      (fallbackowa granica catch-up),

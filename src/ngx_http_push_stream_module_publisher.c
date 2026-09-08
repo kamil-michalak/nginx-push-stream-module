@@ -248,6 +248,7 @@ static void
 ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 {
     ngx_str_t                              *event_id, *event_type, *message_ttl_header, *startup_message_header;
+    ngx_flag_t                              is_startup_message;
     ngx_http_push_stream_module_ctx_t      *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_main_conf_t       *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_loc_conf_t        *cf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
@@ -257,12 +258,20 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     ngx_http_push_stream_requested_channel_t       *requested_channel;
     ngx_queue_t                                    *q;
 
+    /* Startup-Message is a boolean publish header: only the exact value "1"
+       switches this publish into "set/clear the channel's startup message"
+       mode. "0", an empty value, or no header at all => an ordinary publish
+       (body goes to the buffer and is broadcast), same as before this feature
+       existed. Keeps a caller free to always send "Startup-Message: 0". */
     startup_message_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_STARTUP_MESSAGE);
+    is_startup_message = (startup_message_header != NULL)
+        && (startup_message_header->len == 1)
+        && (startup_message_header->data[0] == '1');
 
-    /* A publish carrying the Startup-Message header with an EMPTY body clears
-       the target channel(s)' startup message. Handled before the generic
-       empty-body rejection below. */
-    if ((startup_message_header != NULL) && (r->headers_in.content_length_n <= 0)) {
+    /* A Startup-Message: 1 publish with an EMPTY body clears the target
+       channel(s)' startup message. Handled before the generic empty-body
+       rejection below. */
+    if (is_startup_message && (r->headers_in.content_length_n <= 0)) {
         for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
             requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
             ngx_http_push_stream_set_channel_startup_message(mcf, requested_channel->channel, NULL);
@@ -290,12 +299,12 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     event_type = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE);
     message_ttl_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL);
 
-    /* A publish carrying the Startup-Message header with a non-empty body
-       stores that body as the target channel(s)' startup message: it is NOT
-       appended to the message buffer and NOT broadcast to current
-       subscribers - only replayed to future subscribers that connect without
-       requesting history. Event-Id / Event-Type, if present, apply to it. */
-    if (startup_message_header != NULL) {
+    /* A Startup-Message: 1 publish with a non-empty body stores that body as
+       the target channel(s)' startup message: it is NOT appended to the
+       message buffer and NOT broadcast to current subscribers - only replayed
+       to future subscribers that connect without requesting history.
+       Event-Id / Event-Type, if present, apply to it. */
+    if (is_startup_message) {
         for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
             ngx_http_push_stream_msg_t *startup_msg;
             time_t                      since_time;
