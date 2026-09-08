@@ -625,6 +625,19 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     ctx->frame->payload_len = ngx_http_push_stream_ntohll(len);
                 }
 
+                /* reject an oversized frame from its declared length alone,
+                   before a single payload byte is read or allocated. For a
+                   permessage-deflate frame this bounds the COMPRESSED size;
+                   the decompressed size is checked separately in the inflate
+                   loop below against the same limit. */
+                if ((cf->websocket_max_message_length > 0)
+                    && (ctx->frame->payload_len > cf->websocket_max_message_length)) {
+                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                        "push stream module: websocket frame length %uL exceeds push_stream_websocket_max_message_length %uz - closing connection",
+                        (uint64_t) ctx->frame->payload_len, cf->websocket_max_message_length);
+                    goto close;
+                }
+
                 if (ctx->frame->mask) {
                     ctx->frame->step = NGX_HTTP_PUSH_STREAM_WEBSOCKET_READ_GET_MASK_KEY_STEP;
                     ngx_http_push_stream_set_buffer(&ctx->frame->buf, ctx->frame->mask_key, NULL, 4);
@@ -693,7 +706,10 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         u_char             *inflated;
                         uLong               inflated_size;
                         int                 zret;
-                        uLong               consumed;
+                        uLong               consumed = 0;
+                        size_t              inflate_max = (cf->websocket_max_message_length > 0)
+                                                ? cf->websocket_max_message_length
+                                                : (size_t) NGX_HTTP_PUSH_STREAM_WEBSOCKET_INFLATE_HARD_MAX;
 
                         /* RFC 7692: add back the trailing 0x00 0x00 0xFF 0xFF that
                            the sender stripped before transmitting */
@@ -709,37 +725,74 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                         compressed[ctx->frame->payload_len + 2] = 0xFF;
                         compressed[ctx->frame->payload_len + 3] = 0xFF;
 
-                        /* allocate output buffer - start at 4x, expand once if needed */
+                        /* DEFLATE can expand a payload far past any fixed "Nx of the
+                           compressed size" guess (repetitive JSON routinely 10-20x),
+                           so start from a generous estimate and, whenever inflate()
+                           fills the entire output buffer WITHOUT reaching the end of
+                           the message, double the buffer and run it again from the
+                           start - capped at inflate_max so a crafted frame can't
+                           allocate unbounded memory from the per-frame temp pool.
+                           inflate_max is push_stream_websocket_max_message_length
+                           (the same limit the declared frame length is checked
+                           against), or, when that is disabled (0), the un-turn-off-able
+                           NGX_HTTP_PUSH_STREAM_WEBSOCKET_INFLATE_HARD_MAX backstop.
+                           client_no_context_takeover was negotiated, so this message
+                           is self-contained and re-running inflate on each grow is
+                           safe and cheap. A frame that genuinely decompresses past
+                           the cap closes the connection. */
                         inflated_size = ctx->frame->payload_len * 4 + 256;
-                        inflated = ngx_pcalloc(ctx->temp_pool, inflated_size);
-                        if (inflated == NULL) {
-                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                "push stream module: ws inflate: alloc inflate buf failed");
-                            goto finalize;
+
+                        for ( ;; ) {
+                            if (inflated_size > inflate_max) {
+                                inflated_size = inflate_max;
+                            }
+
+                            inflated = ngx_pcalloc(ctx->temp_pool, inflated_size);
+                            if (inflated == NULL) {
+                                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                    "push stream module: ws inflate: alloc inflate buf failed (%uz bytes)",
+                                    (size_t) inflated_size);
+                                goto finalize;
+                            }
+
+                            ngx_memzero(&zs, sizeof(z_stream));
+                            if (inflateInit2(&zs, -15) != Z_OK) {
+                                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                    "push stream module: ws inflate: inflateInit2 failed");
+                                goto finalize;
+                            }
+
+                            zs.next_in   = compressed;
+                            zs.avail_in  = (uInt)(ctx->frame->payload_len + 4);
+                            zs.next_out  = inflated;
+                            zs.avail_out = (uInt) inflated_size;
+
+                            zret     = inflate(&zs, Z_SYNC_FLUSH);
+                            consumed = inflated_size - zs.avail_out;
+                            inflateEnd(&zs);
+
+                            if (zret != Z_OK && zret != Z_STREAM_END && zret != Z_BUF_ERROR) {
+                                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                    "push stream module: ws inflate: inflate failed ret=%d", zret);
+                                goto finalize;
+                            }
+
+                            /* output buffer completely drained but inflate did not
+                               report end-of-stream => the message is larger than the
+                               current buffer. Grow and retry, or give up at the cap. */
+                            if ((zs.avail_out == 0) && (zret != Z_STREAM_END)) {
+                                if (inflated_size >= inflate_max) {
+                                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                        "push stream module: ws inflate: decompressed frame exceeds %uz bytes - closing connection",
+                                        inflate_max);
+                                    goto finalize;
+                                }
+                                inflated_size *= 2;
+                                continue;
+                            }
+
+                            break;
                         }
-
-                        ngx_memzero(&zs, sizeof(z_stream));
-                        if (inflateInit2(&zs, -15) != Z_OK) {
-                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                "push stream module: ws inflate: inflateInit2 failed");
-                            goto finalize;
-                        }
-
-                        zs.next_in  = compressed;
-                        zs.avail_in = (uInt)(ctx->frame->payload_len + 4);
-                        zs.next_out = inflated;
-                        zs.avail_out = (uInt)inflated_size;
-
-                        zret = inflate(&zs, Z_SYNC_FLUSH);
-                        inflateEnd(&zs);
-
-                        if (zret != Z_OK && zret != Z_STREAM_END && zret != Z_BUF_ERROR) {
-                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                "push stream module: ws inflate: inflate failed ret=%d", zret);
-                            goto finalize;
-                        }
-
-                        consumed = inflated_size - zs.avail_out;
 
                         ctx->frame->payload     = inflated;
                         ctx->frame->payload_len = consumed;
@@ -755,6 +808,18 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                     }
 
                     if (ctx->frame->fragmented) {
+                        /* bound the reassembled size too - otherwise a client can
+                           stream an unlimited number of small continuation frames,
+                           each individually under the per-frame limit, and grow
+                           ctx->temp_pool without end. */
+                        if ((cf->websocket_max_message_length > 0)
+                            && ((ctx->frame->consolidated.len + ctx->frame->payload_len) > cf->websocket_max_message_length)) {
+                            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                "push stream module: reassembled websocket message exceeds push_stream_websocket_max_message_length %uz - closing connection",
+                                cf->websocket_max_message_length);
+                            goto finalize;
+                        }
+
                         if (ctx->frame->consolidated.len == 0) {
                             ctx->frame->consolidated.data = ctx->frame->payload;
                             ctx->frame->consolidated.len = ctx->frame->payload_len;

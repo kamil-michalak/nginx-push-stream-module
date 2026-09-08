@@ -39,6 +39,29 @@
    are sent as-is even to deflate-enabled clients */
 #define NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN 200
 
+/* default for push_stream_websocket_max_message_length: the maximum size, in
+   bytes, of a single message a client may send over a WebSocket connection.
+   Enforced in three places (see ngx_http_push_stream_websocket_reading):
+     - the length declared in the frame header (rejected before the payload
+       is read, so an oversized claim never allocates)
+     - the reassembled size of a fragmented message
+     - the DECOMPRESSED size of a permessage-deflate frame - DEFLATE routinely
+       expands repetitive JSON 10-20x, so the inflate path grows its output
+       buffer and retries until the whole message is drained, but never past
+       this limit, so one small crafted frame cannot inflate into an
+       unbounded allocation from the per-frame temp pool.
+   A client that exceeds it is disconnected. 64 KB is far above any control
+   command or typical JSON publish; raise it with the directive if clients
+   legitimately send larger WebSocket messages, or set it to 0 to disable the
+   declared-length / fragment-reassembly checks entirely. */
+#define NGX_HTTP_PUSH_STREAM_DEFAULT_WEBSOCKET_MAX_MESSAGE_LENGTH 65536
+
+/* absolute ceiling the permessage-deflate inflate path never exceeds, even
+   when push_stream_websocket_max_message_length is 0 ("disabled") - a
+   decompression-bomb backstop that cannot be turned off, so a tiny crafted
+   frame can never inflate into an unbounded per-frame allocation. */
+#define NGX_HTTP_PUSH_STREAM_WEBSOCKET_INFLATE_HARD_MAX (32 * 1024 * 1024)
+
 typedef struct {
     ngx_queue_t                     queue;
     ngx_regex_t                    *agent;
@@ -222,6 +245,8 @@ typedef struct {
                                                    ngx_http_push_stream_get_shared_ping_msg() */
     ngx_flag_t                      websocket_allow_resubscribe;
     ngx_uint_t                      websocket_max_channels_per_connection;
+    size_t                          websocket_max_message_length;  /* max bytes of one inbound WS message; see
+                                                                      NGX_HTTP_PUSH_STREAM_DEFAULT_WEBSOCKET_MAX_MESSAGE_LENGTH */
     ngx_uint_t                      unknown_event_id_behavior;
     ngx_flag_t                      channel_info_on_publish;
     ngx_flag_t                      allow_connections_to_events_channel;

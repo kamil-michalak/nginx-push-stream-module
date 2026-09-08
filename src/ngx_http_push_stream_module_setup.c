@@ -256,6 +256,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, websocket_max_channels_per_connection),
         NULL },
+    { ngx_string("push_stream_websocket_max_message_length"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_size_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_loc_conf_t, websocket_max_message_length),
+        NULL },
     { ngx_string("push_stream_unknown_event_id_behavior"),
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_enum_slot,
@@ -665,6 +671,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     lcf->ping_msg = NULL;
     lcf->websocket_allow_resubscribe = NGX_CONF_UNSET_UINT;
     lcf->websocket_max_channels_per_connection = NGX_CONF_UNSET_UINT;
+    lcf->websocket_max_message_length = NGX_CONF_UNSET_SIZE;
     lcf->unknown_event_id_behavior = NGX_CONF_UNSET_UINT;
     lcf->channel_info_on_publish = NGX_CONF_UNSET_UINT;
     lcf->allow_connections_to_events_channel = NGX_CONF_UNSET_UINT;
@@ -702,6 +709,7 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->ping_message_text, prev->ping_message_text, NGX_HTTP_PUSH_STREAM_PING_MESSAGE_TEXT);
     ngx_conf_merge_value(conf->websocket_allow_resubscribe, prev->websocket_allow_resubscribe, 0);
     ngx_conf_merge_uint_value(conf->websocket_max_channels_per_connection, prev->websocket_max_channels_per_connection, NGX_CONF_UNSET_UINT);
+    ngx_conf_merge_size_value(conf->websocket_max_message_length, prev->websocket_max_message_length, NGX_HTTP_PUSH_STREAM_DEFAULT_WEBSOCKET_MAX_MESSAGE_LENGTH);
     ngx_conf_merge_uint_value(conf->unknown_event_id_behavior, prev->unknown_event_id_behavior, NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_BEHAVIOR_IGNORE);
     ngx_conf_merge_value(conf->channel_info_on_publish, prev->channel_info_on_publish, 1);
     ngx_conf_merge_value(conf->allow_connections_to_events_channel, prev->allow_connections_to_events_channel, 0);
