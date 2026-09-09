@@ -2153,25 +2153,55 @@ ngx_http_push_stream_free_memory_of_expired_messages_and_channels(ngx_flag_t for
 }
 
 
+/*
+ * Walk the WHOLE trash queue instead of stopping at the first entry that
+ * isn't free-able yet.
+ *
+ * data->messages_trash is FIFO (ngx_queue_insert_tail in
+ * ngx_http_push_stream_throw_the_message_away), and expires = insertion
+ * time + a constant TTL, so insertion order does equal expiry order. But
+ * the other half of the eligibility check - workers_ref_count <= 0 - has
+ * nothing to do with insertion order: a message thrown away early can
+ * still have an outstanding reference (e.g. queued in a specific worker's
+ * IPC inbox - see ngx_http_push_stream_send_worker_message /
+ * ngx_http_push_stream_process_worker_message_data - and only cleared once
+ * that particular worker's channel handler catches up) while a *younger*
+ * message's reference has already cleared. The previous "break on the
+ * first non-eligible entry" logic silently assumed FIFO order implied
+ * eligibility order for both halves of the check, which only takes one
+ * lagging (or crashed-and-not-yet-respawned) worker to violate: a single
+ * stuck message permanently blocks every other - already expired, already
+ * unreferenced - entry behind it, so messages_in_trash (and the shm it
+ * holds) grows without bound instead of draining.
+ *
+ * Skipping a not-yet-eligible entry and continuing the scan is exactly as
+ * safe as the old code with respect to that entry: the eligibility check
+ * itself (workers_ref_count <= 0 && expired) is unchanged and still
+ * evaluated per message before it is freed - it is just no longer used to
+ * abandon the rest of the queue. A skipped entry is simply re-checked on
+ * the next sweep (this runs off NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_INTERVAL,
+ * currently 4s).
+ */
 void
 ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force)
 {
     ngx_slab_pool_t                        *shpool = data->shpool;
     ngx_http_push_stream_msg_t             *message;
-    ngx_queue_t                            *cur;
+    ngx_queue_t                            *cur, *next;
 
     ngx_shmtx_lock(&data->messages_trash_mutex);
-    while (!ngx_queue_empty(&data->messages_trash)) {
-        cur = ngx_queue_head(&data->messages_trash);
+    cur = ngx_queue_head(&data->messages_trash);
+    while (cur != ngx_queue_sentinel(&data->messages_trash)) {
+        next = ngx_queue_next(cur);
         message = ngx_queue_data(cur, ngx_http_push_stream_msg_t, queue);
 
         if (force || ((message->workers_ref_count <= 0) && (ngx_time() > message->expires))) {
             ngx_queue_remove(&message->queue);
             ngx_http_push_stream_free_message_memory(shpool, message);
             NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->messages_in_trash);
-        } else {
-            break;
         }
+
+        cur = next;
     }
     ngx_shmtx_unlock(&data->messages_trash_mutex);
     ngx_http_push_stream_free_memory_of_expired_channels(data, shpool, force);
