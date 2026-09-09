@@ -717,60 +717,128 @@ ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *ch
     return NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_NONE;
 }
 
+/*
+ * Sends the catch-up batch (backtrack, or everything after a Last-Event-Id /
+ * If-Modified-Since boundary) to a subscriber.
+ *
+ * The actual sends used to run INLINE inside the channel->mutex critical
+ * section that walks channel->message_queue - one send_response_message()
+ * (send()/writev() attempt) per matching message, while holding the SAME
+ * per-channel lock every publish to this channel also needs. A reconnecting
+ * client with a stale Last-Event-Id can match hundreds of buffered messages
+ * (bounded by push_stream_max_messages_stored_per_channel); sending all of
+ * them synchronously under the lock serializes new publishes - and every
+ * OTHER subscriber's connect/catch-up on this channel - behind this one
+ * reconnect for as long as the batch takes to queue.
+ *
+ * Fixed the same way as ngx_http_push_stream_send_startup_message(): under
+ * channel->mutex, only WALK the queue and COLLECT which messages match,
+ * taking a reference on each (workers_ref_count++) - never send while
+ * holding the lock. The messages queue can be mutated by other workers the
+ * instant the lock is released (eviction on overflow/expiry, new
+ * publishes), so collecting pointers up front (rather than trying to keep
+ * an iterator valid across an unlock) is what makes this safe: the
+ * reference count is what stops ngx_http_push_stream_throw_the_message_away()
+ * from actually freeing a message that's been evicted from the queue but is
+ * still in this batch (see the comment on
+ * ngx_http_push_stream_set_channel_startup_message() for the general
+ * mechanism - it is respected everywhere a message is thrown away, not just
+ * for startup messages).
+ */
 static void
 ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id)
 {
+    ngx_http_push_stream_main_conf_t      *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_msg_t            *message;
     ngx_queue_t                           *q;
+    ngx_http_push_stream_msg_t           **to_send;
+    ngx_uint_t                              to_send_count;
+    ngx_uint_t                              to_send_max;
+    ngx_uint_t                              i;
 
-    if (ngx_http_push_stream_has_old_messages_to_send(channel, backtrack, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id) == NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
-        if (backtrack > 0) {
-            ngx_uint_t qtd = (backtrack > channel->stored_messages) ? channel->stored_messages : backtrack;
-            ngx_uint_t start = channel->stored_messages - qtd;
-            ngx_shmtx_lock(channel->mutex);
-            // positioning at first message, and send the others
-            for (q = ngx_queue_head(&channel->message_queue); (qtd > 0) && q != ngx_queue_sentinel(&channel->message_queue); q = ngx_queue_next(q)) {
-                message = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
-                if (message->deleted) {
-                    break;
-                }
+    if (ngx_http_push_stream_has_old_messages_to_send(channel, backtrack, if_modified_since, tag, greater_message_time, greater_message_tag, last_event_id) != NGX_HTTP_PUSH_STREAM_OLD_MESSAGES_FOUND) {
+        return;
+    }
 
-                if (start == 0) {
-                    qtd--;
-                    ngx_http_push_stream_send_response_message(r, channel, message, 0, ctx->message_sent);
-                } else {
-                    start--;
-                }
+    /* upper bound for the batch - re-read under the lock below too, since
+       this pre-lock value can be stale by the time we actually walk; the
+       collection loops also stop at to_send_max defensively either way */
+    to_send_max = channel->stored_messages;
+    if (to_send_max == 0) {
+        return;
+    }
+
+    to_send = ngx_pcalloc(r->pool, sizeof(ngx_http_push_stream_msg_t *) * to_send_max);
+    if (to_send == NULL) {
+        return;   /* fail closed, same as any other allocation failure on this path */
+    }
+    to_send_count = 0;
+
+    ngx_shmtx_lock(channel->mutex);
+
+    if (backtrack > 0) {
+        ngx_uint_t qtd = (backtrack > channel->stored_messages) ? channel->stored_messages : backtrack;
+        ngx_uint_t start = channel->stored_messages - qtd;
+        // positioning at first message, and collect the others
+        for (q = ngx_queue_head(&channel->message_queue); (qtd > 0) && (to_send_count < to_send_max) && q != ngx_queue_sentinel(&channel->message_queue); q = ngx_queue_next(q)) {
+            message = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
+            if (message->deleted) {
+                break;
             }
-            ngx_shmtx_unlock(channel->mutex);
-        } else if ((last_event_id != NULL) || (if_modified_since >= 0)) {
-            ngx_flag_t found = 0;
-            ngx_shmtx_lock(channel->mutex);
-            for (q = ngx_queue_head(&channel->message_queue); q != ngx_queue_sentinel(&channel->message_queue); q = ngx_queue_next(q)) {
-                message = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
-                if (message->deleted) {
-                    break;
-                }
 
-                if ((!found) && (last_event_id != NULL) && (message->event_id != NULL) && (ngx_memn2cmp(message->event_id->data, last_event_id->data, message->event_id->len, last_event_id->len) == 0)) {
-                    found = 1;
+            if (start == 0) {
+                qtd--;
+                to_send[to_send_count++] = message;
+            } else {
+                start--;
+            }
+        }
+    } else if ((last_event_id != NULL) || (if_modified_since >= 0)) {
+        ngx_flag_t found = 0;
+        for (q = ngx_queue_head(&channel->message_queue); (to_send_count < to_send_max) && q != ngx_queue_sentinel(&channel->message_queue); q = ngx_queue_next(q)) {
+            message = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
+            if (message->deleted) {
+                break;
+            }
+
+            if ((!found) && (last_event_id != NULL) && (message->event_id != NULL) && (ngx_memn2cmp(message->event_id->data, last_event_id->data, message->event_id->len, last_event_id->len) == 0)) {
+                found = 1;
+                continue;
+            }
+
+            if ((!found) && (if_modified_since >= 0) && ((message->time > if_modified_since) || ((message->time == if_modified_since) && (tag >= 0) && (message->tag >= tag)))) {
+                found = 1;
+                if ((message->time == if_modified_since) && (message->tag == tag)) {
                     continue;
                 }
-
-                if ((!found) && (if_modified_since >= 0) && ((message->time > if_modified_since) || ((message->time == if_modified_since) && (tag >= 0) && (message->tag >= tag)))) {
-                    found = 1;
-                    if ((message->time == if_modified_since) && (message->tag == tag)) {
-                        continue;
-                    }
-                }
-
-                if (found && (((greater_message_time == 0) && (greater_message_tag == -1)) || (greater_message_time > message->time) || ((greater_message_time == message->time) && (greater_message_tag >= message->tag)))) {
-                    ngx_http_push_stream_send_response_message(r, channel, message, 0, ctx->message_sent);
-                }
             }
-            ngx_shmtx_unlock(channel->mutex);
+
+            if (found && (((greater_message_time == 0) && (greater_message_tag == -1)) || (greater_message_time > message->time) || ((greater_message_time == message->time) && (greater_message_tag >= message->tag)))) {
+                to_send[to_send_count++] = message;
+            }
         }
+    }
+
+    /* take the reference BEFORE dropping the lock - see the function
+       comment above for why this is what makes sending outside
+       channel->mutex, below, safe */
+    for (i = 0; i < to_send_count; i++) {
+        to_send[i]->workers_ref_count++;
+    }
+
+    ngx_shmtx_unlock(channel->mutex);
+
+    for (i = 0; i < to_send_count; i++) {
+        ngx_http_push_stream_send_response_message(r, channel, to_send[i], 0, ctx->message_sent);
+    }
+
+    if (to_send_count > 0) {
+        ngx_shmtx_lock(&mcf->shpool->mutex);
+        for (i = 0; i < to_send_count; i++) {
+            to_send[i]->workers_ref_count--;
+        }
+        ngx_shmtx_unlock(&mcf->shpool->mutex);
     }
 }
 
@@ -798,19 +866,43 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
  *      (0, 0) - startup message set on an empty channel - replays the whole
  *      buffer, which is correct: the snapshot predates every message.
  *
- * The snapshot send is done under channel->mutex (like send_old_messages),
- * which also serializes it against ngx_http_push_stream_set_channel_startup_message()
- * swapping/freeing the message from another worker. Everything the follow-up
- * replay needs (boundary event-id copied into the request pool, or the
- * time/tag pair) is taken before the lock is dropped, so that replay - which
- * re-locks channel->mutex itself - is unaffected by a concurrent replace.
+ * The actual response send (the send_response_message call below) happens
+ * OUTSIDE channel->mutex - this per-channel lock is also needed by every
+ * publish to the channel (ngx_http_push_stream_add_msg_to_channel), so
+ * holding it across a send()/writev() attempt serializes new publishes
+ * behind every reconnecting subscriber's startup-message send; on a hot
+ * channel during a reconnect storm that stalls publishing to it.
+ *
+ * Dropping the lock before the send is only safe because the message is
+ * reference-counted first (msg->workers_ref_count++, mirroring how a
+ * normal queued message is protected while an IPC-fanned-out copy is still
+ * being delivered - see ngx_http_push_stream_send_worker_message /
+ * ngx_http_push_stream_free_worker_message_memory): a concurrent
+ * ngx_http_push_stream_set_channel_startup_message() on another worker can
+ * still swap channel->startup_message the moment channel->mutex is
+ * released here, but it can no longer free THIS message synchronously - it
+ * always defers through ngx_http_push_stream_throw_the_message_away(),
+ * which only actually frees once the reference count is back to 0 AND a
+ * grace-period TTL has passed (see the comment on
+ * ngx_http_push_stream_set_channel_startup_message). That grace period is
+ * what covers the send_response_message() call below being zero-copy: it
+ * queues a buffer pointing straight into this message's shared memory, and
+ * for a slow client that buffer can still be unflushed by the time this
+ * function returns.
+ *
+ * Everything the follow-up replay needs (boundary event-id copied into the
+ * request pool, or the time/tag pair) is taken before channel->mutex is
+ * dropped, so that replay - which re-locks channel->mutex itself - is
+ * unaffected by a concurrent replace.
  *
  * Returns 1 if a startup message was sent, 0 otherwise.
  */
 static ngx_flag_t
 ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel)
 {
+    ngx_http_push_stream_main_conf_t      *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
+    ngx_http_push_stream_msg_t            *msg;
     ngx_str_t                             *boundary_event_id = NULL;
     time_t                                 since_time = -1;
     ngx_int_t                              since_tag = -1;
@@ -820,22 +912,32 @@ ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_s
     }
 
     ngx_shmtx_lock(channel->mutex);
-    if ((channel->startup_message == NULL) || channel->startup_message->deleted) {
+    msg = channel->startup_message;
+    if ((msg == NULL) || msg->deleted) {
         ngx_shmtx_unlock(channel->mutex);
         return 0;
     }
-    since_time = channel->startup_message->time;
-    since_tag  = channel->startup_message->tag;
-    if (channel->startup_message->event_id != NULL) {
-        /* copy it out of shared memory - the startup message (and this id with
-           it) may be freed by a concurrent replace once the lock is dropped */
-        boundary_event_id = ngx_http_push_stream_create_str(r->pool, channel->startup_message->event_id->len);
+    since_time = msg->time;
+    since_tag  = msg->tag;
+    if (msg->event_id != NULL) {
+        /* copy it out of shared memory - msg->event_id is only safe to
+           dereference while channel->mutex or the reference taken below is
+           held; the request pool copy outlives both */
+        boundary_event_id = ngx_http_push_stream_create_str(r->pool, msg->event_id->len);
         if (boundary_event_id != NULL) {
-            ngx_memcpy(boundary_event_id->data, channel->startup_message->event_id->data, channel->startup_message->event_id->len);
+            ngx_memcpy(boundary_event_id->data, msg->event_id->data, msg->event_id->len);
         }
     }
-    ngx_http_push_stream_send_response_message(r, channel, channel->startup_message, 0, ctx->message_sent);
+    /* see the long comment above this function for why this reference is
+       what makes sending outside channel->mutex, below, safe */
+    msg->workers_ref_count++;
     ngx_shmtx_unlock(channel->mutex);
+
+    ngx_http_push_stream_send_response_message(r, channel, msg, 0, ctx->message_sent);
+
+    ngx_shmtx_lock(&mcf->shpool->mutex);
+    msg->workers_ref_count--;
+    ngx_shmtx_unlock(&mcf->shpool->mutex);
 
     /* replay the buffer from the boundary: the snapshot's Event-Id if it has
        one, otherwise the stream position captured when it was set */

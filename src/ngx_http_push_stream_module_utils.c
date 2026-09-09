@@ -1474,12 +1474,25 @@ ngx_http_push_stream_send_response_message(ngx_http_request_t *r, ngx_http_push_
 
 /*
  * Atomically replace (new_msg != NULL) or clear (new_msg == NULL) a channel's
- * startup message, freeing the previous one. The swap is done under
- * channel->mutex so a concurrent ngx_http_push_stream_send_startup_message()
- * on any worker either sees the old message (and finishes sending it before
- * we free) or the new one - never a dangling pointer. The actual free happens
- * after the lock is dropped: once the pointer is swapped, no new reader can
- * reach the old message.
+ * startup message. The swap is done under channel->mutex, so no new reader
+ * can observe old_msg as channel->startup_message once this returns - but
+ * "no new reader can observe it" is not the same as "no reader still has it".
+ *
+ * ngx_http_push_stream_send_startup_message() reads channel->startup_message
+ * and hands it to ngx_http_push_stream_send_response_message() OUTSIDE
+ * channel->mutex (to avoid holding this per-channel lock - which every
+ * publish to the channel also needs - across a send()/writev() attempt). Its
+ * response buffer is zero-copy (points straight into this message's shared
+ * memory) and, for a slow client, can still be sitting unflushed in the
+ * connection's write queue after that function returns. So old_msg must NOT
+ * be freed synchronously here: it is always routed through the same
+ * trash+grace-period mechanism a normal queued message already uses
+ * (ngx_http_push_stream_throw_the_message_away) - actually freed only once
+ * msg->workers_ref_count (incremented by send_startup_message before it
+ * drops channel->mutex, decremented after the send call returns) is back to
+ * 0 AND NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL (10s) has
+ * passed - comfortably longer than any non-pathological socket write takes
+ * to drain.
  */
 void
 ngx_http_push_stream_set_channel_startup_message(ngx_http_push_stream_main_conf_t *mcf, ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *new_msg)
@@ -1496,7 +1509,7 @@ ngx_http_push_stream_set_channel_startup_message(ngx_http_push_stream_main_conf_
     ngx_shmtx_unlock(channel->mutex);
 
     if (old_msg != NULL) {
-        ngx_http_push_stream_free_message_memory(mcf->shpool, old_msg);
+        ngx_http_push_stream_throw_the_message_away(old_msg, mcf->shm_data);
     }
 }
 

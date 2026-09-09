@@ -48,7 +48,44 @@ Nowe ryzyka wydajnościowe są skupione w kilku miejscach poniżej.
 
 ## Problemy wydajnościowe (wg wagi)
 
-### 🔴 1. Burza reconnectów (deploy / reload / failover LB) — główne ryzyko przy 100k
+### 🔴 1. Burza reconnectów (deploy / reload / failover LB) — główne ryzyko przy 100k  ✅ NAPRAWIONE (branch `test23`)
+
+> **Fix zaaplikowany 2026-09-09 (dwie części):**
+>
+> **Część 1 — `send_startup_message`** (krok 2). Pod `channel->mutex`: odczyt
+> wskaźnika `channel->startup_message`, `msg->workers_ref_count++`, kopia
+> event-id do `r->pool`, unlock. Wysyłka (`send_response_message` → syscall
+> zapisu) leci **poza** lockiem. Bezpieczne dzięki refcountowi — to ten sam
+> mechanizm co fix #2, nie dwa osobne.
+>
+> **Część 2 — `send_old_messages`** (krok 3, catch-up dla klientów z
+> `Last-Event-Id`/backtrack). Wcześniej pętla wysyłająca N pasujących
+> wiadomości (do `max_messages_stored_per_channel`, setki) leciała **w
+> całości pod `channel->mutex`** — jeden `send_response_message` na
+> wiadomość, wszystkie pod tym samym per-kanałowym lockiem co publish.
+> Teraz: pod lockiem tylko **skan + zebranie wskaźników** do tablicy
+> (`ngx_pcalloc(r->pool, ...)`, rozmiar = `channel->stored_messages`) +
+> `workers_ref_count++` na każdej zebranej wiadomości; unlock; wysyłka
+> całej paczki **poza lockiem**; dekrement refcountów pod `shpool->mutex`
+> po wysyłce. Bezpieczne z tego samego powodu co #2 — lista
+> `channel->message_queue` może się zmienić pod nami w dowolnym momencie po
+> odblokowaniu (eviction przy przepełnieniu/wygaśnięciu, nowa publikacja),
+> więc nie da się trzymać iteratora przez unlock — trzeba zebrać wskaźniki
+> z góry i zabezpieczyć je refcountem, tak jak w #2.
+>
+> Krok 1 (`has_old_messages_to_send`, wywoływane raz na starcie
+> `send_old_messages` i raz przez wołających wcześniej — patrz #7,
+> nienaprawione) nadal skanuje pod lockiem, ale to **tylko skan** (memcmp na
+> ~512 wiadomościach, bez I/O) — rząd wielkości tańszy niż wysyłka, więc
+> pozostawiony bez zmian.
+>
+> Zweryfikowane end-to-end pod realnym buildem (`-Werror -Wall`, zero
+> warningów): 20 szybkich podmian `Startup-Message` na gorący kanał +
+> równoległy subscriber (bez crashy, `messages_in_trash` poprawnie
+> rośnie/spada po TTL); catch-up przez `Last-Event-Id` (5 wiadomości,
+> poprawna kolejność od granicy); `backtrack=2` i `backtrack=30` na 55
+> zbuforowanych wiadomościach (poprawna liczba i kolejność ramek, pierwsza/
+> ostatnia zgodne z oczekiwaniem).
 
 Na świeżym połączeniu **bez `Last-Event-Id`** ścieżka `subscriber_assign_channel`
 robi teraz sekwencyjnie:
@@ -88,11 +125,44 @@ pełny skan bufora pod lockiem *zanim* subskrybent zostanie zarejestrowany.
 - jitter po stronie klienta przy reconnekcie (rozłożyć w czasie)
 - rozważyć `message_ttl` > najgorszy realny czas przestoju, żeby event-id nie
   wygasały masowo
-- rozważyć wysyłkę snapshotu **poza** `channel->mutex` (skopiować wskaźnik msg pod
-  lockiem, `workers_ref_count++`, wysłać po zwolnieniu) — obecnie snapshot leci
-  pod lockiem
+- ✅ wysyłka snapshotu **i** catch-upu **poza** `channel->mutex` — zaimplementowane
+  (obie części), patrz ramka wyżej. Pod lockiem zostaje tylko sam skan
+  (`has_old_messages_to_send`, tanie, bez I/O)
 
-### 🟠 2. UAF przy wolnym kliencie a wymiana `startup_message` / `channel_deleted_message`
+### 🟠 2. UAF przy wolnym kliencie a wymiana `startup_message` / `channel_deleted_message`  ✅ NAPRAWIONE dla `startup_message` (branch `test23`)
+
+> **Fix zaaplikowany 2026-09-09:** to i fix #1 to **jeden mechanizm**, nie dwa
+> osobne — nie da się bezpiecznie wysłać snapshotu poza `channel->mutex` (#1)
+> bez jednoczesnego zamknięcia tego UAF, bo to dokładnie to samo okno czasowe
+> widziane z dwóch końców.
+>
+> - `send_startup_message()` (`subscriber.c`) — pod `channel->mutex`:
+>   `msg->workers_ref_count++` **przed** unlockiem. Gwarantuje, że żaden
+>   `set_channel_startup_message()` nie może już podmienić wskaźnika w
+>   sposób, który pozwoliłby ominąć ten refcount (podmiana i inkrement są w
+>   tym samym krytycznym sekcji `channel->mutex` — nie mogą się przeplatać).
+>   Po wysyłce (poza lockiem): dekrement pod `shpool->mutex` (ta sama
+>   konwencja co `ngx_http_push_stream_free_worker_message_memory`).
+> - `set_channel_startup_message()` (`utils.c`) — zamiast bezwarunkowego
+>   `free_message_memory(old)`, **zawsze** `ngx_http_push_stream_throw_the_message_away(old_msg, ...)`
+>   — ten sam mechanizm trash+TTL co zwykłe wiadomości z kolejki
+>   (`NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL` = 10s).
+>   Realne zwolnienie dopiero gdy `workers_ref_count<=0` **i** TTL minął —
+>   nie próbuje się precyzyjnie śledzić momentu faktycznego flush do
+>   socketu (nginx nie daje na to czystego hooka), tylko daje bezpieczny
+>   margines jak dla zwykłych wiadomości.
+>
+> **`channel_deleted_message` NIE jest tu tknięty** — inny cykl życia
+> (ustawiany raz przy usunięciu kanału, sam kanał i tak czeka
+> `NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL` = 10s w
+> `channels_trash` zanim `nxg_http_push_stream_free_channel_memory` go
+> zwolni — ma więc już wbudowany 10s grace, mniej pilne). Zostaje jako
+> mniejsze ryzyko rezydualne.
+>
+> Zweryfikowane end-to-end: publish `Startup-Message: 1` × 20 w pętli na
+> gorący kanał + subskrybent w locie — brak crashy/CRIT w logu, kolejny
+> subskrybent dostaje najnowszy snapshot, `messages_in_trash` rośnie przy
+> podmianach i poprawnie spada do 0 po ~10s.
 
 `send_response_text` / `send_content` to **zero-copy** (`b->memory=1`, wskaźnik
 prosto w shm). Bufor zostaje w łańcuchu `busy` połączenia dopóki klient nie odbierze.
