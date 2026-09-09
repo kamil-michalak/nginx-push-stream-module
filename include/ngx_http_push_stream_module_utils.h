@@ -56,7 +56,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_PLAIN = ngx_strin
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_PLAIN = ngx_string(CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_PLAIN = ngx_string("hostname: %s" CRLF "time: %s" CRLF "channels: %ui" CRLF "wildcard_channels: %ui" CRLF "published_messages: %ui" CRLF "stored_messages: %ui" CRLF "messages_in_trash: %ui" CRLF "channels_in_delete: %ui" CRLF "channels_in_trash: %ui" CRLF "subscribers: %ui" CRLF "uptime: %ui" CRLF "shm_zone_total_mb: %uz" CRLF "shm_free_pages: %ui" CRLF "shm_free_mb: %uz" CRLF "shm_pagesize: %uz" CRLF "by_worker:"CRLF"%s" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_PLAIN = ngx_string("hostname: %s" CRLF "time: %s" CRLF "channels: %ui" CRLF "wildcard_channels: %ui" CRLF "published_messages: %ui" CRLF "stored_messages: %ui" CRLF "messages_in_trash: %ui" CRLF "channels_in_delete: %ui" CRLF "channels_in_trash: %ui" CRLF "subscribers: %ui" CRLF "uptime: %ui" CRLF "shm_zone_total_mb: %uz" CRLF "shm_free_pages: %ui" CRLF "shm_free_mb: %uz" CRLF "shm_pagesize: %uz" CRLF "shm_free_runs: %ui" CRLF "shm_largest_free_run_kb: %uz" CRLF "by_worker:"CRLF"%s" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_PLAIN = ngx_string("text/plain");
@@ -69,7 +69,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_JSON = ngx_string
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_JSON = ngx_string("]}" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN CRLF);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_JSON = ngx_string("{\"hostname\": \"%s\", \"time\": \"%s\", \"channels\": %ui, \"wildcard_channels\": %ui, \"published_messages\": %ui, \"stored_messages\": %ui, \"messages_in_trash\": %ui, \"channels_in_delete\": %ui, \"channels_in_trash\": %ui, \"subscribers\": %ui, \"uptime\": %ui, \"shm_zone_total_mb\": %uz, \"shm_free_pages\": %ui, \"shm_free_mb\": %uz, \"shm_pagesize\": %uz, \"by_worker\": [" CRLF "%s" CRLF"]}" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_JSON = ngx_string("{\"hostname\": \"%s\", \"time\": \"%s\", \"channels\": %ui, \"wildcard_channels\": %ui, \"published_messages\": %ui, \"stored_messages\": %ui, \"messages_in_trash\": %ui, \"channels_in_delete\": %ui, \"channels_in_trash\": %ui, \"subscribers\": %ui, \"uptime\": %ui, \"shm_zone_total_mb\": %uz, \"shm_free_pages\": %ui, \"shm_free_mb\": %uz, \"shm_pagesize\": %uz, \"shm_free_runs\": %ui, \"shm_largest_free_run_kb\": %uz, \"by_worker\": [" CRLF "%s" CRLF"]}" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN "," CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_JSON = ngx_string("application/json");
@@ -82,7 +82,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_YAML = ngx_string
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_YAML = ngx_string(CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_ITEM_YAML = ngx_string(" -" CRLF NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_LAST_ITEM_YAML = ngx_string(" -" CRLF NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN);
-static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_YAML = ngx_string("  hostname: %s" CRLF"  time: %s" CRLF"  channels: %ui" CRLF"  wildcard_channels: %ui" CRLF"  published_messages: %ui" CRLF"  stored_messages: %ui" CRLF"  messages_in_trash: %ui" CRLF"  channels_in_delete: %ui" CRLF"  channels_in_trash: %ui" CRLF"  subscribers: %ui" CRLF"  uptime: %ui" CRLF"  shm_zone_total_mb: %uz" CRLF"  shm_free_pages: %ui" CRLF"  shm_free_mb: %uz" CRLF"  shm_pagesize: %uz" CRLF"  by_worker:"CRLF"%s" CRLF);
+static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_YAML = ngx_string("  hostname: %s" CRLF"  time: %s" CRLF"  channels: %ui" CRLF"  wildcard_channels: %ui" CRLF"  published_messages: %ui" CRLF"  stored_messages: %ui" CRLF"  messages_in_trash: %ui" CRLF"  channels_in_delete: %ui" CRLF"  channels_in_trash: %ui" CRLF"  subscribers: %ui" CRLF"  uptime: %ui" CRLF"  shm_zone_total_mb: %uz" CRLF"  shm_free_pages: %ui" CRLF"  shm_free_mb: %uz" CRLF"  shm_pagesize: %uz" CRLF"  shm_free_runs: %ui" CRLF"  shm_largest_free_run_kb: %uz" CRLF"  by_worker:"CRLF"%s" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_YAML = ngx_string("   -" CRLF NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_LAST_ITEM_YAML = ngx_string("   -" CRLF NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_YAML = ngx_string("application/yaml");
@@ -125,6 +125,8 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_XML = ngx_string
         "  <shm_free_pages>%ui</shm_free_pages>" CRLF \
         "  <shm_free_mb>%uz</shm_free_mb>" CRLF \
         "  <shm_pagesize>%uz</shm_pagesize>" CRLF \
+        "  <shm_free_runs>%ui</shm_free_runs>" CRLF \
+        "  <shm_largest_free_run_kb>%uz</shm_largest_free_run_kb>" CRLF \
         "  <by_worker>%s</by_worker>" CRLF \
         "</infos>" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNELS_INFO_SUMMARIZED_WORKER_ITEM_XML = ngx_string(NGX_HTTP_PUSH_STREAM_WORKER_INFO_XML_PATTERN);

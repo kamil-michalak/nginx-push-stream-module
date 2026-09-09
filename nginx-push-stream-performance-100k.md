@@ -169,7 +169,36 @@ footprint**. Dedupe `raw` przez fan-out odzyskuje część. Przy 512 wiadomości
 × tysiące kanałów w 24G trzeba monitorować nowe pola `shm_free_mb` /
 `shm_free_pages` w `/channels-stats` (summarized).
 
-### 🟡 5. `ngx_http_push_stream_shm_free_pages()` pod `shpool->mutex` na endpoincie statystyk
+### 🟡 5. `ngx_http_push_stream_shm_free_pages()` pod `shpool->mutex` na endpoincie statystyk  ✅ NAPRAWIONE (branch `test23`)
+
+> **Fix zaaplikowany 2026-09-09:** `ngx_http_push_stream_get_shm_gauge()` w
+> `utils.c` — cache per-worker z TTL 3 s (`NGX_HTTP_PUSH_STREAM_SHM_GAUGE_TTL`):
+> `total_size` liczony raz (niezmienny po inicjalizacji strefy, czytany bez
+> locka), walk free-listy odświeżany co najwyżej raz na TTL, **twardy cap**
+> `NGX_HTTP_PUSH_STREAM_SHM_GAUGE_WALK_CAP` = 4096 runów niezależnie od TTL
+> (flaga `capped` sygnalizuje zaniżenie). Endpoint stats i diagnostyka
+> alloc-failure (#11) współdzielą ten sam cache.
+>
+> **Przy okazji naprawiony błąd w samej metryce:** stara wersja liczyła
+> **wpisy listy** (runy), nie strony, i podpisywała to jako `shm_free_pages` →
+> `shm_free_mb` był zaniżony nawet o 1–2 rzędy wielkości pod fragmentacją.
+> Zweryfikowane end-to-end: świeża strefa 32 MB, jeden wolny run →
+> stara logika zwróciłaby `shm_free_pages: 1` → `shm_free_mb: 0`; nowa
+> poprawnie: `shm_free_pages: 8128, shm_free_mb: 31`.
+>
+> **Dwa nowe pola w `/channels-stats` summarized** (wszystkie formaty:
+> PLAIN/JSON/YAML/XML): `shm_free_runs` (fragmentacja — rosnące przy płaskim
+> `shm_free_mb` = pogarszająca się fragmentacja) i
+> `shm_largest_free_run_kb` (**najważniejsza liczba** — jeśli mniejsza od
+> Twojej największej alokacji, dostaniesz „no memory" mimo wolnego miejsca).
+>
+> Zweryfikowane realnym buildem (`-Werror -Wall`, zero warningów, `make`
+> pełnego `objs/nginx`) i uruchomieniem: handshake WS, `?`-ping→pong,
+> `push_stream_websocket_max_message_length` odrzuca zbyt długą deklarowaną
+> ramkę (close frame, bez czytania payloadu), `push_stream_websocket_permessage_deflate off`
+> poprawnie nie zwraca nagłówka rozszerzenia mimo oferty klienta.
+>
+> Opis problemu poniżej dla kontekstu.
 
 Walk po liście wolnych *runów* (nie pojedynczych stron — więc O(fragmentacja), nie
 O(6M stron)) pod **globalnym** `shpool->mutex`. Wołane przy każdym `ngx_slab_alloc`
@@ -209,11 +238,14 @@ kontencję — patrz #1).
    kilkuset celowo wolnych klientów (throttle odbioru), pod ASAN/valgrind lub z
    małym `push_stream_shared_memory_size` (szybsza rotacja).
 3. **CPU publikacji #3**: profil `perf` publishera przy realnym fan-out gola (ile
-   kanałów, ile `deflateInit2`/s).
+   kanałów, ile kompresji/s) — po fixie `deflateReset` sprawdzić czy churn
+   alokatora zniknął.
 4. **shm**: obserwować `shm_free_mb` przez 24–48h przy produkcyjnym ruchu — czy
    trend opada (wyciek) czy stabilny.
-5. **RSS workerów #8**: 100k WS z klienckim `?`-ping keepalive przez kilka godzin —
-   czy RSS per worker rośnie liniowo (narost `r->pool`).
+5. **RSS workerów #8**: 24–48 h produkcyjnego ruchu — czy RSS per worker rośnie
+   monotonicznie (narost `r->pool` z acków komend `+`/`-`/`?`). Przy
+   `ping_mode application` + przeglądarki spodziewany płaski; jeśli rośnie →
+   recyklowany `ctx->cmd_out` (patrz #8).
 6. **Inflate #9**: klient wysyła skompresowaną ramkę WS ~5–10 KB (kompresowalną
    >4×), sprawdzić czy dochodzi w całości czy połączenie jest zrywane.
 
@@ -223,28 +255,59 @@ kontencję — patrz #1).
 
 Dodatkowe ustalenia, których nie ma w rankingu 1–7 powyżej:
 
-### 🔴 8. `r->pool` rośnie bez ograniczenia na długożyjących połączeniach WS
+### 🟡 8. `r->pool` rośnie monotonicznie z liczbą komend na połączeniu WS
+
+> **Korekta 2026-09-09:** pierwotnie oceniony 🔴 z fixem „przenieś na
+> `ctx->temp_pool`". Po analizie: **fix przez `temp_pool` jest błędny** (UAF),
+> a skala dla konfiguracji f24 jest niska. Zejście na 🟡. Szczegóły niżej.
 
 Nowe ścieżki komend WS alokują z `r->pool`, który żyje przez **całe** połączenie
-(przy `subscriber_connection_ttl 4h` — do 4 godzin):
+(request WS nie finalizuje się aż socket się zamknie; przy
+`subscriber_connection_ttl 4h` — do 4 h, przy `0` — bezterminowo). Pule nginx to
+alokatory bump — brak zwalniania pojedynczej alokacji, pamięć wraca dopiero przy
+`ngx_destroy_pool`.
 
 - `ngx_http_push_stream_websocket_handle_ping()` — `json` + `frame` z `r->pool`
-  przy **każdym** `?`-pingu (`websocket.c` ~74, ~92)
+  przy **każdym** `?`-pingu (`websocket.c` ~97, ~115)
 - `ngx_http_push_stream_websocket_send_ack()` — przy każdym `+` / `-` / błędzie
-  (`websocket.c` ~17, ~23)
-- `handle_subscribe()` — JSON `unknown_event_id` + frame z `r->pool` (~184)
-- `send_startup_message()` — `boundary_event_id` kopiowany do `r->pool` przy każdym
+  (`websocket.c` ~40, ~46)
+- `handle_subscribe()` — JSON `unknown_event_id` + frame z `r->pool` (~207)
+- `send_startup_message()` — `boundary_event_id` do `r->pool` przy każdym
   resubscribe bez event-id (`subscriber.c` ~486)
 
-Ścieżka **publikacji** przez WS poprawnie używa `ctx->temp_pool` (niszczony
-per-frame w `next_frame:`), ale ścieżki komend — nie. Aplikacja używająca `?`-ping
-jako keepalive albo dynamicznego `+`/`-` puchnie liniowo: 100k połączeń × kilka
-alokacji/min × godziny = wielogigabajtowy narost RSS workerów **niewidoczny w
-`shm`** (to pamięć procesu, nie strefa współdzielona). Upstreamowy WS tego nie miał
-(czytał tylko ramki + publish na temp_pool).
+Każda alokacja ~60–280 B, **za każdym razem gdy klient wyśle tę komendę**,
+zwalniane dopiero przy rozłączeniu → monotoniczny narost RSS workera per
+połączenie, **niewidoczny w `shm`** (to pamięć procesu, nie strefa współdzielona;
+`/channels-stats` tego nie pokazuje — widać tylko jako rosnący RSS procesu).
 
-**Fix:** wszystkie alokacje komend przenieść na krótkotrwały pool (utworzyć per
-komenda i zniszczyć po wysłaniu ramki), jak zrobiono dla publisha.
+**Dlaczego to NIE jest naiwny błąd — `r->pool` jest tu wyborem bezpieczeństwa:**
+`send_response_text` jest **zero-copy** (`b->memory = 1; b->pos = text` — wskaźnik
+prosto w pulę). Bajty ramki muszą przeżyć **asynchroniczny** zapis do socketu;
+przy zatkanym TCP (a przy 100k połączeń część zawsze jest) nginx trzyma bufor w
+łańcuchu `busy` i `b->pos` musi być ważne aż się opróżni. Przeniesienie na
+`ctx->temp_pool` (niszczoną per-ramka) daje **use-after-free** na acku wolnego
+klienta. Ścieżka głównych wiadomości jest bezpieczna, bo źródłem jest shared
+memory (żyje `message_ttl` = 10 min).
+
+**Skala dla f24 — prawdopodobnie niska:** `push_stream_ping_mode application` =
+**serwer** pinguje klienta, bezczynna przeglądarka nic nie wysyła → zero narostu.
+Narost tylko z `+`/`-` resubscribe (nawigacja między meczami), ewentualnego
+klienckiego `?`-pingu, publish przez WS. Szac. user przełączający mecz co minutę
+przez godzinę ≈ 120 acków × ~160 B ≈ ~19 KB/h/połączenie; przez 4 h TTL
+kilkadziesiąt–kilkaset KB, × 100k ≈ jednostki GB w skali floty, resetowane przy
+recyklingu połączeń na TTL.
+
+**Właściwy fix (jeśli pomiar pokaże narost):** jeden mały bufor wyjściowy komend
+**recyklowany per połączenie** — w danym momencie w locie jest zawsze jedna
+ramka-odpowiedź. W `ctx`: `cmd_out` ~512 B alokowane raz z `r->pool`, każdy
+ack/pong pisany do tego samego bufora, nadpisanie dopiero gdy łańcuch `busy`
+połączenia jest pusty (fallback: jednorazowa alokacja z `r->pool` w rzadkim
+przypadku zatkania). Efekt: stała pamięć wyjścia komend per połączenie zamiast
+liniowej, bez ryzyka UAF.
+
+**Do zrobienia najpierw:** zmierzyć RSS workerów przez 24–48 h produkcyjnego
+ruchu (netdata, metryki procesu). Przy `ping_mode application` + przeglądarki
+najpewniej płaski — wtedy fix niepotrzebny.
 
 ### 🟠 9. Dekompresja permessage-deflate ucina większe ramki → rozłączenie klienta  ✅ NAPRAWIONE (branch `test23`)
 
@@ -310,7 +373,17 @@ zerowym zysku, jeśli klienci deflate nie występują. Brak dyrektywy typu
 (deflate zawsze) więc zysk jest realny — ale brak kill-switcha na wypadek
 regresji CPU/pamięci pod produkcyjnym fan-outem.
 
-### 🟡 11. `log_slab_alloc_failure()` woła `shm_free_pages()` na KAŻDYM nieudanym alloc
+### 🟡 11. `log_slab_alloc_failure()` woła `shm_free_pages()` na KAŻDYM nieudanym alloc  ✅ NAPRAWIONE (branch `test23`)
+
+> **Fix zaaplikowany 2026-09-09:** dwie niezależne warstwy, patrz #5:
+> 1. sam walk korzysta teraz z cache'owanego gauge'a (TTL 3 s) — większość
+>    wywołań w serii failures w ogóle nie bierze `shpool->mutex`
+> 2. **rate-limit samej linii logu** (`NGX_HTTP_PUSH_STREAM_ALLOC_FAILURE_LOG_INTERVAL`
+>    = 2 s) niezależnie od cache'u gauge'a — burza failures generowała też
+>    burzę linii `NGX_LOG_CRIT` (I/O logu); teraz pierwsza awaria loguje się
+>    natychmiast, kolejne w oknie 2 s są tylko zliczane
+>    (`ngx_http_push_stream_suppressed_alloc_failures`) i zwinięte w
+>    kolejną linię („N more failures suppressed in the last 2s")
 
 Doprecyzowanie #5: w warunkach fragmentacji (czyli tych, dla których feature
 powstał) alokacje sypią się **seriami**, a każdy failure przechodzi całą free-listę
