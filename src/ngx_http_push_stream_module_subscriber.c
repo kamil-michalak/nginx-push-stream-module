@@ -665,6 +665,9 @@ ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_st
     ngx_shmtx_unlock(&shpool->mutex);
     thisworker_data->subscribers++;
 
+    // dimension counters (push_stream_stat_counter) - resolve keys once, bump gauges
+    ngx_http_push_stream_stat_register(r, worker_subscriber);
+
     return NGX_OK;
 }
 
@@ -1019,6 +1022,9 @@ ngx_http_push_stream_assing_subscription_to_channel(ngx_slab_pool_t *shpool, ngx
     ngx_shmtx_unlock(channel->mutex);
 
     ngx_http_push_stream_send_event(mcf, log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_SUBSCRIBED, NULL);
+
+    // per=channel dimension counters (push_stream_stat_counter ... per=channel)
+    ngx_http_push_stream_stat_subscription_register(subscription);
 
     return NGX_OK;
 }

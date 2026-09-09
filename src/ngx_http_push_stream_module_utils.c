@@ -593,6 +593,9 @@ ngx_http_push_stream_delete_channels_data(ngx_http_push_stream_shm_data_t *data)
                 ngx_queue_remove(&subscription->channel_worker_queue);
                 ngx_shmtx_unlock(channel->mutex);
 
+                // per=channel dimension counters - drop this subscription's gauge contribution
+                ngx_http_push_stream_stat_subscription_unregister(subscription);
+
                 ngx_http_push_stream_send_event(mcf, ngx_cycle->log, subscription->channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED, subscriber->request->pool);
 
                 if (subscriber->longpolling) {
@@ -2624,6 +2627,9 @@ ngx_http_push_stream_worker_subscriber_cleanup(ngx_http_push_stream_subscriber_t
         ngx_queue_remove(&subscription->queue);
         ngx_shmtx_unlock(subscription->channel->mutex);
 
+        // per=channel dimension counters - drop this subscription's gauge contribution
+        ngx_http_push_stream_stat_subscription_unregister(subscription);
+
         ngx_http_push_stream_send_event(mcf, ngx_cycle->log, subscription->channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED, worker_subscriber->request->pool);
     }
 
@@ -2632,6 +2638,9 @@ ngx_http_push_stream_worker_subscriber_cleanup(ngx_http_push_stream_subscriber_t
     NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->subscribers);
     NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->ipc[ngx_process_slot].subscribers);
     ngx_shmtx_unlock(&shpool->mutex);
+
+    // dimension counters (push_stream_stat_counter) - drop this connection's gauge contribution
+    ngx_http_push_stream_stat_unregister(worker_subscriber);
 }
 
 

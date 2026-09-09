@@ -27,6 +27,7 @@
 #include <ngx_http_push_stream_module_setup.c>
 #include <ngx_http_push_stream_rbtree_util.c>
 #include <ngx_http_push_stream_module_utils.c>
+#include <ngx_http_push_stream_module_stats.c>
 #include <ngx_http_push_stream_module_ipc.c>
 #include <ngx_http_push_stream_module_publisher.c>
 #include <ngx_http_push_stream_module_subscriber.c>

@@ -260,6 +260,9 @@ ngx_http_push_stream_websocket_handle_unsubscribe(ngx_http_request_t *r,
             ngx_queue_remove(&subscription->queue);
             ngx_shmtx_unlock(subscription->channel->mutex);
 
+            // per=channel dimension counters - drop this subscription's gauge contribution
+            ngx_http_push_stream_stat_subscription_unregister(subscription);
+
             ngx_http_push_stream_send_event(mcf, r->connection->log,
                 subscription->channel,
                 &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CLIENT_UNSUBSCRIBED,

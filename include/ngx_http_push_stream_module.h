@@ -213,10 +213,27 @@ typedef struct {
     ngx_str_t                       events_channel_id;
     ngx_regex_t                    *backtrack_parser_regex;
     ngx_http_push_stream_msg_t     *longpooling_timeout_msg;
+    ngx_uint_t                      stat_max_keys;  /* default per-group cap on distinct dimension keys
+                                                       (push_stream_stat_max_keys); overflow folds into
+                                                       one "__overflow__" bucket per group */
     ngx_shm_zone_t                 *shm_zone;
     ngx_slab_pool_t                *shpool;
     ngx_http_push_stream_shm_data_t*shm_data;
 } ngx_http_push_stream_main_conf_t;
+
+/* one push_stream_stat_counter directive: a named group + the complex-value
+   template rendered once per connection into that group's key. See
+   ngx_http_push_stream_module_stats.c */
+typedef struct {
+    ngx_str_t                       group;
+    ngx_http_complex_value_t        key_template;
+    ngx_uint_t                      max_key_len;   /* bytes; 0 => NGX_HTTP_PUSH_STREAM_STAT_DEFAULT_KEY_LEN */
+    ngx_uint_t                      max_keys;      /* 0 => mcf->stat_max_keys */
+    ngx_flag_t                      per_channel;   /* per=channel: bump once per SUBSCRIPTION (each channel a
+                                                     connection joins, +channel/-channel included), template
+                                                     token ~channel~ replaced with the channel id. Default 0
+                                                     (per=connection: one bump per connection). */
+} ngx_http_push_stream_stat_counter_t;
 
 /* one entry for push_stream_websocket_extra_header directive:
    header name (static) + value (nginx complex value, may contain variables) */
@@ -265,6 +282,9 @@ typedef struct {
     ngx_str_t                       padding_by_user_agent;
     ngx_queue_t                    *paddings;
     ngx_http_complex_value_t       *allowed_origins;
+    ngx_array_t                    *stat_counters;  /* of ngx_http_push_stream_stat_counter_t; NGX_CONF_UNSET_PTR
+                                                       until set. Inherited additively: a child location's own
+                                                       entries come first, then the parent's are appended. */
 } ngx_http_push_stream_loc_conf_t;
 
 // shared memory segment name
@@ -401,12 +421,41 @@ typedef struct {
 } ngx_http_push_stream_channel_info_t;
 
 
+/*
+ * One live dimension-counter bucket: (group, key) -> {active, total}, in shared
+ * memory. Looked up / created at connection registration, never freed (only ever
+ * added, like ngx_http_push_stream_shared_ping_msg_s), so a pointer handed to a
+ * subscriber stays valid for the life of the zone and survives reload (the tree
+ * and queue live on ngx_http_push_stream_shm_data_s, which the reload branch of
+ * ngx_http_push_stream_init_shm_zone reuses). See ngx_http_push_stream_module_stats.c.
+ */
+typedef struct {
+    ngx_rbtree_node_t                          node;    /* node.key = crc32(group '\0' key) */
+    ngx_queue_t                                queue;   /* d->stats_queue - iteration / output */
+    ngx_str_t                                  group;   /* copy in shared memory */
+    ngx_str_t                                  key;     /* copy in shared memory */
+    ngx_uint_t                                 active;  /* currently-connected (gauge) - live inc/dec */
+    ngx_uint_t                                 total;   /* connections ever opened (monotonic) */
+} ngx_http_push_stream_stat_bucket_t;
+
+/* per-group key count, so the max_keys cap applies per group, not globally */
+typedef struct {
+    ngx_queue_t                                queue;   /* d->stats_groups */
+    ngx_str_t                                  name;    /* copy in shared memory */
+    ngx_uint_t                                 nkeys;   /* distinct buckets in this group */
+} ngx_http_push_stream_stat_group_t;
+
 typedef struct {
     ngx_queue_t                         queue;
     ngx_queue_t                         channel_worker_queue;
     ngx_http_push_stream_subscriber_t  *subscriber;
     ngx_http_push_stream_channel_t     *channel;
     ngx_http_push_stream_pid_queue_t   *channel_worker_sentinel;
+    /* per=channel dimension-counter buckets this subscription contributes 1 to
+       (ngx_http_push_stream_stat_subscription_register); decremented wherever the
+       subscription is removed (connection close, -channel, channel deletion). */
+    ngx_http_push_stream_stat_bucket_t **stat_buckets;
+    ngx_uint_t                           stat_buckets_n;
 } ngx_http_push_stream_subscription_t;
 
 struct ngx_http_push_stream_subscriber_s {
@@ -415,6 +464,11 @@ struct ngx_http_push_stream_subscriber_s {
     ngx_pid_t                                   worker_subscribed_pid;
     ngx_flag_t                                  longpolling;
     ngx_queue_t                                 worker_queue;
+    /* dimension-counter buckets this connection contributes 1 to, resolved once
+       at registration (ngx_http_push_stream_stat_register) from the location's
+       push_stream_stat_counter set; decremented in worker_subscriber_cleanup. */
+    ngx_http_push_stream_stat_bucket_t        **stat_buckets;
+    ngx_uint_t                                  stat_buckets_n;
 };
 
 typedef struct {
@@ -526,6 +580,16 @@ struct ngx_http_push_stream_shm_data_s {
                                                                      survives reload - see comment on that struct */
     ngx_shmtx_t                             ping_msgs_mutex;
     ngx_shmtx_sh_t                          ping_msgs_lock;
+    /* dimension-counter store (push_stream_stat_counter). Survives reload like
+       ping_msgs above - it lives on this struct, which the reload branch reuses.
+       See ngx_http_push_stream_module_stats.c */
+    ngx_rbtree_t                            stats_tree;
+    ngx_rbtree_node_t                       stats_sentinel;
+    ngx_queue_t                             stats_queue;         /* all ngx_http_push_stream_stat_bucket_t */
+    ngx_queue_t                             stats_groups;        /* ngx_http_push_stream_stat_group_t (per-group key count) */
+    ngx_uint_t                              stats_buckets;       /* total # buckets (all groups) */
+    ngx_shmtx_t                             stats_mutex;
+    ngx_shmtx_sh_t                          stats_lock;
 };
 
 ngx_shm_zone_t     *ngx_http_push_stream_global_shm_zone = NULL;
@@ -646,6 +710,12 @@ static const ngx_str_t NGX_HTTP_PUSH_STREAM_UNKNOWN_EVENT_ID_JSON =
 #define NGX_HTTP_PUSH_STREAM_PUBLISHER_MODE_NORMAL       5
 #define NGX_HTTP_PUSH_STREAM_PUBLISHER_MODE_ADMIN        6
 #define NGX_HTTP_PUSH_STREAM_STATISTICS_MODE             7
+#define NGX_HTTP_PUSH_STREAM_STATS_DIMENSIONS_MODE       8   /* push_stream_stats_dimensions endpoint */
+
+/* push_stream_stat_counter: default cap on the rendered key length (bytes) */
+#define NGX_HTTP_PUSH_STREAM_STAT_DEFAULT_KEY_LEN        96
+/* per-group default cap on distinct keys when push_stream_stat_max_keys is unset */
+#define NGX_HTTP_PUSH_STREAM_STAT_DEFAULT_MAX_KEYS       50000
 
 
 #define NGX_HTTP_PUSH_STREAM_WEBSOCKET_VERSION_8         8

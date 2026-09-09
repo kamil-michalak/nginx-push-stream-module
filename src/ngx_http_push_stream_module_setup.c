@@ -316,6 +316,24 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_push_stream_loc_conf_t, allow_connections_to_events_channel),
         NULL },
+    { ngx_string("push_stream_stat_counter"),
+        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_2MORE,
+        ngx_http_push_stream_set_stat_counter,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL },
+    { ngx_string("push_stream_stat_max_keys"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_main_conf_t, stat_max_keys),
+        NULL },
+    { ngx_string("push_stream_stats_dimensions"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
+        ngx_http_push_stream_stats_dimensions,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL },
 
     ngx_null_command
 };
@@ -436,6 +454,10 @@ ngx_http_push_stream_preconfig(ngx_conf_t *cf)
 
     shm_zone->init = ngx_http_push_stream_init_global_shm_zone;
     shm_zone->data = (void *) 1;
+
+    if (ngx_http_push_stream_stats_add_variables(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -561,6 +583,7 @@ ngx_http_push_stream_create_main_conf(ngx_conf_t *cf)
     mcf->timeout_with_body = NGX_CONF_UNSET;
     ngx_str_null(&mcf->events_channel_id);
     mcf->longpooling_timeout_msg = NULL;
+    mcf->stat_max_keys = NGX_CONF_UNSET_UINT;
     ngx_queue_init(&mcf->msg_templates);
 
     return mcf;
@@ -579,6 +602,7 @@ ngx_http_push_stream_init_main_conf(ngx_conf_t *cf, void *parent)
     ngx_conf_init_value(conf->message_ttl, NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TTL);
     ngx_conf_init_value(conf->channel_inactivity_time, NGX_HTTP_PUSH_STREAM_DEFAULT_CHANNEL_INACTIVITY_TIME);
     ngx_conf_init_value(conf->channel_inactivity_delete_with_subscribers, 0);
+    ngx_conf_init_uint_value(conf->stat_max_keys, NGX_HTTP_PUSH_STREAM_STAT_DEFAULT_MAX_KEYS);
     ngx_conf_merge_str_value(conf->channel_deleted_message_text, conf->channel_deleted_message_text, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT);
     ngx_conf_merge_str_value(conf->wildcard_channel_prefix, conf->wildcard_channel_prefix, NGX_HTTP_PUSH_STREAM_DEFAULT_WILDCARD_CHANNEL_PREFIX);
     ngx_conf_merge_str_value(conf->events_channel_id, conf->events_channel_id, NGX_HTTP_PUSH_STREAM_DEFAULT_EVENTS_CHANNEL_ID);
@@ -693,6 +717,7 @@ ngx_http_push_stream_create_loc_conf(ngx_conf_t *cf)
     ngx_str_null(&lcf->padding_by_user_agent);
     lcf->paddings = NULL;
     lcf->allowed_origins = NULL;
+    lcf->stat_counters = NGX_CONF_UNSET_PTR;
 
     return lcf;
 }
@@ -752,7 +777,28 @@ ngx_http_push_stream_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->allowed_origins = prev->allowed_origins ;
     }
 
+    /* push_stream_stat_counter: inherit additively - a child location keeps its
+       own entries and gets the parent's appended after them. */
+    if (conf->stat_counters == NGX_CONF_UNSET_PTR) {
+        conf->stat_counters = (prev->stat_counters == NGX_CONF_UNSET_PTR) ? NULL : prev->stat_counters;
+    } else if ((prev->stat_counters != NGX_CONF_UNSET_PTR) && (prev->stat_counters != NULL)) {
+        ngx_http_push_stream_stat_counter_t *pel = prev->stat_counters->elts;
+        ngx_uint_t pi;
+        for (pi = 0; pi < prev->stat_counters->nelts; pi++) {
+            ngx_http_push_stream_stat_counter_t *ne = ngx_array_push(conf->stat_counters);
+            if (ne == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *ne = pel[pi];
+        }
+    }
+
     if (conf->location_type == NGX_CONF_UNSET_UINT) {
+        return NGX_CONF_OK;
+    }
+
+    /* the dimension-stats endpoint is unrelated to channels */
+    if (conf->location_type == NGX_HTTP_PUSH_STREAM_STATS_DIMENSIONS_MODE) {
         return NGX_CONF_OK;
     }
 
@@ -1292,6 +1338,10 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     }
 
     if (ngx_http_push_stream_create_shmtx(&d->ping_msgs_mutex, &d->ping_msgs_lock, (u_char *) "push_stream_ping_msgs") != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_push_stream_stats_init_shm(d) != NGX_OK) {
         return NGX_ERROR;
     }
 

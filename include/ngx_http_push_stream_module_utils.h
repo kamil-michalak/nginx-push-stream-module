@@ -327,4 +327,12 @@ ngx_int_t                   ngx_http_push_stream_create_shmtx(ngx_shmtx_t *mtx, 
 
 ngx_flag_t                  ngx_http_push_stream_is_utf8(u_char *p, size_t n);
 
+/* dimension counters - ngx_http_push_stream_module_stats.c */
+ngx_int_t                   ngx_http_push_stream_stats_init_shm(ngx_http_push_stream_shm_data_t *d);
+ngx_int_t                   ngx_http_push_stream_stats_add_variables(ngx_conf_t *cf);
+void                        ngx_http_push_stream_stat_register(ngx_http_request_t *r, ngx_http_push_stream_subscriber_t *sub);
+void                        ngx_http_push_stream_stat_unregister(ngx_http_push_stream_subscriber_t *sub);
+void                        ngx_http_push_stream_stat_subscription_register(ngx_http_push_stream_subscription_t *subscription);
+void                        ngx_http_push_stream_stat_subscription_unregister(ngx_http_push_stream_subscription_t *subscription);
+
 #endif /* NGX_HTTP_PUSH_STREAM_MODULE_UTILS_H_ */
