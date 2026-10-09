@@ -506,18 +506,37 @@ ngx_http_push_stream_raw_content_unref(ngx_slab_pool_t *shpool, ngx_http_push_st
 static void            ngx_http_push_stream_flush_pending_output(ngx_http_request_t *r);
 
 
+/*
+ * try_lock: background sweeps pass 1 - a channel whose mutex is busy (a
+ * publish formatting a large message, a delivery) is skipped and picked up by
+ * the next sweep instead of putting the worker to sleep on it.
+ *
+ * Evicted messages are only unlinked under channel->mutex and handed to the
+ * trash after it is released: throw_the_message_away() takes
+ * messages_trash_mutex, and waiting for it here would keep channel->mutex -
+ * and every worker delivering a channel that shares it - blocked too.
+ */
 ngx_uint_t
-ngx_http_push_stream_ensure_qtd_of_messages(ngx_http_push_stream_shm_data_t *data, ngx_http_push_stream_channel_t *channel, ngx_uint_t max_messages, ngx_flag_t expired)
+ngx_http_push_stream_ensure_qtd_of_messages(ngx_http_push_stream_shm_data_t *data, ngx_http_push_stream_channel_t *channel, ngx_uint_t max_messages, ngx_flag_t expired, ngx_flag_t try_lock)
 {
     ngx_http_push_stream_msg_t             *msg;
     ngx_queue_t                            *q;
+    ngx_queue_t                             removed;
     ngx_uint_t                              qtd_removed = 0;
 
     if (max_messages == NGX_CONF_UNSET_UINT) {
         return qtd_removed;
     }
 
-    ngx_shmtx_lock(channel->mutex);
+    if (try_lock) {
+        if (!ngx_shmtx_trylock(channel->mutex)) {
+            return qtd_removed;
+        }
+    } else {
+        ngx_shmtx_lock(channel->mutex);
+    }
+
+    ngx_queue_init(&removed);
     while (!ngx_queue_empty(&channel->message_queue) && ((channel->stored_messages > max_messages) || expired)) {
         q = ngx_queue_head(&channel->message_queue);
         msg = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
@@ -529,11 +548,112 @@ ngx_http_push_stream_ensure_qtd_of_messages(ngx_http_push_stream_shm_data_t *dat
         qtd_removed++;
         NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(channel->stored_messages);
         ngx_queue_remove(&msg->queue);
-        ngx_http_push_stream_throw_the_message_away(msg, data);
+        ngx_queue_insert_tail(&removed, &msg->queue);
     }
     ngx_shmtx_unlock(channel->mutex);
 
+    while (!ngx_queue_empty(&removed)) {
+        q = ngx_queue_head(&removed);
+        msg = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
+        ngx_queue_remove(q);
+        ngx_http_push_stream_throw_the_message_away(msg, data);
+    }
+
     return qtd_removed;
+}
+
+
+/*
+ * Per-worker growable pointer array for the "copy under a short lock, work
+ * after unlocking" pattern of the cleanup paths below. Workers are
+ * single-threaded and every user keeps its own buffer - no locking needed.
+ */
+typedef struct {
+    void          **elts;
+    ngx_uint_t      nalloc;
+} ngx_http_push_stream_ptr_buf_t;
+
+static ngx_http_push_stream_ptr_buf_t  ngx_http_push_stream_sweep_channels_buf;
+static ngx_http_push_stream_ptr_buf_t  ngx_http_push_stream_delete_channels_buf;
+
+static ngx_int_t
+ngx_http_push_stream_ptr_buf_reserve(ngx_http_push_stream_ptr_buf_t *buf, ngx_uint_t n)
+{
+    void          **elts;
+
+    if (n <= buf->nalloc) {
+        return NGX_OK;
+    }
+
+    n = ngx_max(n, 2 * buf->nalloc);
+    if ((elts = ngx_alloc(n * sizeof(void *), ngx_cycle->log)) == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (buf->elts != NULL) {
+        ngx_free(buf->elts);
+    }
+    buf->elts = elts;
+    buf->nalloc = n;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Copy the active channels (data->channels_queue) into buf, holding the
+ * global channels_queue_mutex - which every publish and subscribe needs for
+ * its channel lookup - only for the pointer copy, never while waiting on a
+ * channel->mutex. The pointers stay valid after the unlock: a channel leaves
+ * channels_queue for channels_to_delete or channels_trash and is freed only
+ * from channels_trash, by the cleanup_mutex holder (which the sweeps using
+ * this are), NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL
+ * after it got there. Callers check channel->deleted instead.
+ *
+ * Sized from the unlocked counters with headroom; channels created past that
+ * between the read and the lock are left to the next sweep.
+ */
+static ngx_uint_t
+ngx_http_push_stream_snapshot_channels(ngx_http_push_stream_shm_data_t *data, ngx_http_push_stream_ptr_buf_t *buf)
+{
+    ngx_queue_t                            *q;
+    ngx_uint_t                              n = 0;
+
+    if (ngx_http_push_stream_ptr_buf_reserve(buf, data->channels + data->wildcard_channels + 256) != NGX_OK) {
+        return 0;
+    }
+
+    ngx_shmtx_lock(&data->channels_queue_mutex);
+    for (q = ngx_queue_head(&data->channels_queue); (q != ngx_queue_sentinel(&data->channels_queue)) && (n < buf->nalloc); q = ngx_queue_next(q)) {
+        buf->elts[n++] = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
+    }
+    ngx_shmtx_unlock(&data->channels_queue_mutex);
+
+    return n;
+}
+
+
+/* expire the stored messages of a channel snapshot; a busy channel is skipped
+   (try_lock) unless force - at master exit nothing else runs */
+static void
+ngx_http_push_stream_expire_channels_messages(ngx_http_push_stream_shm_data_t *data, ngx_http_push_stream_channel_t **channels, ngx_uint_t n, ngx_flag_t force)
+{
+    ngx_http_push_stream_channel_t         *channel;
+    ngx_uint_t                              i, qtd_removed = 0;
+
+    for (i = 0; i < n; i++) {
+        channel = channels[i];
+        if (channel->deleted) {
+            continue;
+        }
+        qtd_removed += ngx_http_push_stream_ensure_qtd_of_messages(data, channel, (force) ? 0 : channel->stored_messages, 1, !force);
+    }
+
+    if (qtd_removed > 0) {
+        ngx_shmtx_lock(&data->channels_queue_mutex);
+        NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER_BY(data->stored_messages, qtd_removed);
+        ngx_shmtx_unlock(&data->channels_queue_mutex);
+    }
 }
 
 
@@ -549,18 +669,47 @@ ngx_http_push_stream_delete_channels(void)
     }
 }
 
+/*
+ * Every worker runs this on a DELETE_CHANNEL alert (sent to all of them at
+ * once) and from its 4 s cleanup timer. It used to send the deleted message
+ * to - and finalize - each of its subscribers of each deleted channel while
+ * holding the global channels_to_delete_mutex, so the workers queued up
+ * behind each other's socket writes. Now the channels are copied under the
+ * lock and handled after it is released. A channel stays in
+ * channels_to_delete while it has subscribers (collect_deleted_channels_data
+ * moves it to the trash only at 0) and is freed from the trash only
+ * NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL later, so the
+ * copied pointers stay valid for this pass.
+ */
 void
 ngx_http_push_stream_delete_channels_data(ngx_http_push_stream_shm_data_t *data)
 {
     ngx_http_push_stream_main_conf_t            *mcf = data->mcf;
+    ngx_http_push_stream_ptr_buf_t              *buf = &ngx_http_push_stream_delete_channels_buf;
     ngx_http_push_stream_channel_t              *channel;
     ngx_http_push_stream_pid_queue_t            *worker, *channel_worker;
     ngx_queue_t                                 *cur_worker, *cur;
     ngx_queue_t                                 *q;
+    ngx_uint_t                                   n = 0, i;
+
+    /* unlocked peek - true for nearly every 4 s timer tick; a channel queued
+       after it comes with its own DELETE_CHANNEL alert */
+    if (ngx_queue_empty(&data->channels_to_delete)) {
+        return;
+    }
+
+    if (ngx_http_push_stream_ptr_buf_reserve(buf, data->channels_in_delete + 16) != NGX_OK) {
+        return;
+    }
 
     ngx_shmtx_lock(&data->channels_to_delete_mutex);
-    for (q = ngx_queue_head(&data->channels_to_delete); q != ngx_queue_sentinel(&data->channels_to_delete); q = ngx_queue_next(q)) {
-        channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
+    for (q = ngx_queue_head(&data->channels_to_delete); (q != ngx_queue_sentinel(&data->channels_to_delete)) && (n < buf->nalloc); q = ngx_queue_next(q)) {
+        buf->elts[n++] = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
+    }
+    ngx_shmtx_unlock(&data->channels_to_delete_mutex);
+
+    for (i = 0; i < n; i++) {
+        channel = buf->elts[i];
         worker = NULL;
 
         // remove subscribers if any
@@ -615,7 +764,6 @@ ngx_http_push_stream_delete_channels_data(ngx_http_push_stream_shm_data_t *data)
             }
         }
     }
-    ngx_shmtx_unlock(&data->channels_to_delete_mutex);
 }
 
 void
@@ -637,7 +785,7 @@ ngx_http_push_stream_collect_deleted_channels_data(ngx_http_push_stream_shm_data
         q = ngx_queue_next(q);
 
         // remove all messages
-        qtd_removed = ngx_http_push_stream_ensure_qtd_of_messages(data, channel, 0, 0);
+        qtd_removed = ngx_http_push_stream_ensure_qtd_of_messages(data, channel, 0, 0, 0);
         if (qtd_removed > 0) {
             ngx_shmtx_lock(&data->channels_queue_mutex);
             NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER_BY(data->stored_messages, qtd_removed);
@@ -1435,7 +1583,7 @@ ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, n
     ngx_shmtx_unlock(channel->mutex);
 
     // now see if the queue is too big
-    qtd_removed = ngx_http_push_stream_ensure_qtd_of_messages(data, channel, mcf->max_messages_stored_per_channel, 0);
+    qtd_removed = ngx_http_push_stream_ensure_qtd_of_messages(data, channel, mcf->max_messages_stored_per_channel, 0, 0);
 
     if (!channel->for_events) {
         ngx_shmtx_lock(&data->channels_queue_mutex);
@@ -2109,8 +2257,10 @@ void
 ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force)
 {
     ngx_http_push_stream_main_conf_t   *mcf = data->mcf;
-    ngx_http_push_stream_channel_t     *channel;
-    ngx_queue_t                        *q;
+    ngx_http_push_stream_ptr_buf_t     *buf = &ngx_http_push_stream_sweep_channels_buf;
+    ngx_http_push_stream_channel_t     *channel, **channels;
+    ngx_uint_t                          n, i;
+    ngx_flag_t                          moved;
     ngx_pool_t                         *temp_pool = NULL;
     /* channels with subscribers that need deletion - collected while locked,
        processed after unlocking to avoid calling delete_channel under mutex.
@@ -2141,17 +2291,28 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
         return;
     }
 
-    ngx_http_push_stream_collect_expired_messages_data(data, force);
+    /* one snapshot for both passes - expiring stored messages and retiring
+       empty, inactive channels - instead of two walks of channels_queue under
+       channels_queue_mutex (see ngx_http_push_stream_snapshot_channels) */
+    n = ngx_http_push_stream_snapshot_channels(data, buf);
+    channels = (ngx_http_push_stream_channel_t **) buf->elts;
 
-    ngx_shmtx_lock(&data->channels_queue_mutex);
-    for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue);) {
-        channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
-        q = ngx_queue_next(q);
+    ngx_http_push_stream_expire_channels_messages(data, channels, n, force);
 
-        if ((channel->stored_messages == 0) && (channel->expires < ngx_time()) && !channel->for_events) {
+    for (i = 0; i < n; i++) {
+        channel = channels[i];
 
-            if (channel->subscribers == 0) {
-                /* standard path: no subscribers - move directly to trash */
+        /* unlocked pre-check; the move to trash below re-checks it under
+           channels_queue_mutex, same as the old single locked walk did */
+        if (channel->deleted || (channel->stored_messages != 0) || (channel->expires >= ngx_time()) || channel->for_events) {
+            continue;
+        }
+
+        if (channel->subscribers == 0) {
+            /* standard path: no subscribers - move directly to trash */
+            moved = 0;
+            ngx_shmtx_lock(&data->channels_queue_mutex);
+            if (!channel->deleted && (channel->stored_messages == 0) && (channel->expires < ngx_time()) && (channel->subscribers == 0)) {
                 channel->deleted = 1;
                 channel->expires = ngx_time() + NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL;
                 (channel->wildcard) ? NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->wildcard_channels) : NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->channels);
@@ -2162,39 +2323,38 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
                 ngx_queue_insert_tail(&data->channels_trash, &channel->queue);
                 data->channels_in_trash++;
                 ngx_shmtx_unlock(&data->channels_trash_mutex);
-
-                ngx_http_push_stream_send_event(mcf, ngx_cycle->log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CHANNEL_DESTROYED, temp_pool);
-
-            } else if (mcf->channel_inactivity_delete_with_subscribers
-                       && !ngx_exiting
-                       && !ngx_terminate
-                       && !ngx_quit
-                       && !channel->deleted
-                       /* grace period: require the channel to be expired by more than
-                          just the raw threshold before disconnecting live subscribers.
-                          A single delayed/late "keepalive" publish should not be enough
-                          to tear down an otherwise-active connection. */
-                       && (channel->expires < (ngx_time() - NGX_HTTP_PUSH_STREAM_INACTIVITY_GRACE_PERIOD))
-                       && to_delete_count < NGX_PS_MAX_DELETE_BATCH) {
-                /* new path: has subscribers but channel is inactive and empty.
-                   Collect for deletion - must call delete_channel AFTER releasing
-                   the channels_queue_mutex to avoid deadlock.
-                   Skipped entirely while this worker is shutting down: during
-                   reload, cleanup_shutting_down_worker_data() will force-close
-                   every subscriber on this worker anyway, so there is nothing
-                   to gain here and doing it risks racing with that shutdown
-                   path (and the IPC alert below could block if a sibling
-                   worker is also mid-shutdown and not draining its channel). */
-                to_delete[to_delete_count++] = channel;
+                moved = 1;
             }
+            ngx_shmtx_unlock(&data->channels_queue_mutex);
+
+            if (moved) {
+                ngx_http_push_stream_send_event(mcf, ngx_cycle->log, channel, &NGX_HTTP_PUSH_STREAM_EVENT_TYPE_CHANNEL_DESTROYED, temp_pool);
+            }
+
+        } else if (mcf->channel_inactivity_delete_with_subscribers
+                   && !ngx_exiting
+                   && !ngx_terminate
+                   && !ngx_quit
+                   /* grace period: require the channel to be expired by more than
+                      just the raw threshold before disconnecting live subscribers.
+                      A single delayed/late "keepalive" publish should not be enough
+                      to tear down an otherwise-active connection. */
+                   && (channel->expires < (ngx_time() - NGX_HTTP_PUSH_STREAM_INACTIVITY_GRACE_PERIOD))
+                   && to_delete_count < NGX_PS_MAX_DELETE_BATCH) {
+            /* has subscribers but channel is inactive and empty.
+               Skipped entirely while this worker is shutting down: during
+               reload, cleanup_shutting_down_worker_data() will force-close
+               every subscriber on this worker anyway, so there is nothing
+               to gain here and doing it risks racing with that shutdown
+               path. */
+            to_delete[to_delete_count++] = channel;
         }
     }
-    ngx_shmtx_unlock(&data->channels_queue_mutex);
 
     /* delete inactive channels that still have subscribers:
        delete_channel sends channel_deleted_message to each subscriber,
        finalizes their requests and moves channel to channels_to_delete queue */
-    for (ngx_uint_t i = 0; i < to_delete_count; i++) {
+    for (i = 0; i < to_delete_count; i++) {
         channel = to_delete[i];
         /* guard: verify channel is still in active queue (not already deleted
            by another worker between unlock above and now) */
@@ -2217,23 +2377,21 @@ ngx_http_push_stream_collect_expired_messages_and_empty_channels_data(ngx_http_p
 }
 
 
+/*
+ * Used to walk channels_queue holding channels_queue_mutex for the whole
+ * sweep, taking every channel->mutex inside it: one busy channel kept the
+ * global lock - and so every publish and subscribe on every worker - waiting.
+ * Now a snapshot (see ngx_http_push_stream_snapshot_channels) and per-channel
+ * trylock.
+ */
 static void
 ngx_http_push_stream_collect_expired_messages_data(ngx_http_push_stream_shm_data_t *data, ngx_flag_t force)
 {
-    ngx_http_push_stream_channel_t         *channel;
-    ngx_queue_t                            *q;
-    ngx_uint_t                              qtd_removed;
+    ngx_http_push_stream_ptr_buf_t         *buf = &ngx_http_push_stream_sweep_channels_buf;
+    ngx_uint_t                              n;
 
-    ngx_shmtx_lock(&data->channels_queue_mutex);
-
-    for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
-        channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
-
-        qtd_removed = ngx_http_push_stream_ensure_qtd_of_messages(data, channel, (force) ? 0 : channel->stored_messages, 1);
-        NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER_BY(data->stored_messages, qtd_removed);
-    }
-
-    ngx_shmtx_unlock(&data->channels_queue_mutex);
+    n = ngx_http_push_stream_snapshot_channels(data, buf);
+    ngx_http_push_stream_expire_channels_messages(data, (ngx_http_push_stream_channel_t **) buf->elts, n, force);
 }
 
 
@@ -2374,6 +2532,13 @@ ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_
     ngx_slab_pool_t                        *shpool = data->shpool;
     ngx_http_push_stream_msg_t             *message;
     ngx_queue_t                            *cur, *next;
+    ngx_queue_t                             freeable;
+
+    /* Only unlink the free-able messages under messages_trash_mutex and free
+       them after it is released: freeing (shpool->mutex, every chunk of the
+       content) for thousands of messages used to keep the trash locked, and
+       every throw_the_message_away() - publishes, evictions - waited. */
+    ngx_queue_init(&freeable);
 
     ngx_shmtx_lock(&data->messages_trash_mutex);
     cur = ngx_queue_head(&data->messages_trash);
@@ -2383,13 +2548,21 @@ ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_
 
         if (force || ((message->workers_ref_count <= 0) && (ngx_time() > message->expires))) {
             ngx_queue_remove(&message->queue);
-            ngx_http_push_stream_free_message_memory(shpool, message);
+            ngx_queue_insert_tail(&freeable, &message->queue);
             NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->messages_in_trash);
         }
 
         cur = next;
     }
     ngx_shmtx_unlock(&data->messages_trash_mutex);
+
+    while (!ngx_queue_empty(&freeable)) {
+        cur = ngx_queue_head(&freeable);
+        message = ngx_queue_data(cur, ngx_http_push_stream_msg_t, queue);
+        ngx_queue_remove(cur);
+        ngx_http_push_stream_free_message_memory(shpool, message);
+    }
+
     ngx_http_push_stream_free_memory_of_expired_channels(data, shpool, force);
 }
 

@@ -35,7 +35,15 @@
 
 void ngx_http_push_stream_ipc_init_worker_data(ngx_http_push_stream_shm_data_t *data);
 static ngx_inline void ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_data_t *data);
-static ngx_inline void ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t *data);
+static ngx_inline ngx_flag_t ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t *data);
+static void ngx_http_push_stream_ipc_resume_handler(ngx_event_t *ev);
+
+/* IPC inbox messages handled per call (each = one write to every subscriber
+   of its channel on this worker); the rest waits for the next event loop
+   iteration, see ngx_http_push_stream_process_worker_message */
+#define NGX_HTTP_PUSH_STREAM_IPC_MESSAGES_PER_CALL  32
+
+static ngx_event_t  ngx_http_push_stream_ipc_resume_event;
 
 /*
  * ngx_http_push_stream_socketpairs (below) is a plain BSS global, zero-
@@ -159,6 +167,10 @@ ngx_http_push_stream_init_ipc(ngx_cycle_t *cycle, ngx_int_t workers)
 static void
 ngx_http_push_stream_ipc_exit_worker(ngx_cycle_t *cycle)
 {
+    if (ngx_http_push_stream_ipc_resume_event.posted) {
+        ngx_delete_posted_event(&ngx_http_push_stream_ipc_resume_event);
+    }
+
     ngx_close_channel((ngx_socket_t *) ngx_http_push_stream_socketpairs[ngx_process_slot], cycle->log);
 }
 
@@ -293,6 +305,10 @@ ngx_http_push_stream_clean_worker_data(ngx_http_push_stream_shm_data_t *data)
 static ngx_int_t
 ngx_http_push_stream_register_worker_message_handler(ngx_cycle_t *cycle)
 {
+    ngx_memzero(&ngx_http_push_stream_ipc_resume_event, sizeof(ngx_event_t));
+    ngx_http_push_stream_ipc_resume_event.handler = ngx_http_push_stream_ipc_resume_handler;
+    ngx_http_push_stream_ipc_resume_event.log = cycle->log;
+
     if (ngx_add_channel_event(cycle, ngx_http_push_stream_socketpairs[ngx_process_slot][1], NGX_READ_EVENT, ngx_http_push_stream_channel_handler) == NGX_ERROR) {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno, "failed to register channel handler while initializing push stream module worker");
         return NGX_ERROR;
@@ -453,29 +469,63 @@ ngx_http_push_stream_census_worker_subscribers_data(ngx_http_push_stream_shm_dat
 }
 
 
+/*
+ * The inbox used to be drained completely in one call. After any stall - the
+ * worker waiting on a lock, a burst of publishes - that meant one long run of
+ * socket writes during which this worker accepted nothing and answered
+ * nothing (healthcheck included). Now at most
+ * NGX_HTTP_PUSH_STREAM_IPC_MESSAGES_PER_CALL per call; if more is left the
+ * resume event goes to ngx_posted_next_events, i.e. it runs on the next event
+ * loop iteration, after the I/O that is ready by then. Senders only alert on
+ * an empty -> non-empty inbox, so a non-empty inbox relies on this event.
+ */
 static ngx_inline void
 ngx_http_push_stream_process_worker_message(void)
 {
     ngx_http_push_stream_global_shm_data_t *global_data = (ngx_http_push_stream_global_shm_data_t *) ngx_http_push_stream_global_shm_zone->data;
     ngx_queue_t                            *q;
+    ngx_flag_t                              pending = 0;
 
     for (q = ngx_queue_head(&global_data->shm_datas_queue); q != ngx_queue_sentinel(&global_data->shm_datas_queue); q = ngx_queue_next(q)) {
         ngx_http_push_stream_shm_data_t *data = ngx_queue_data(q, ngx_http_push_stream_shm_data_t, shm_data_queue);
-        ngx_http_push_stream_process_worker_message_data(data);
+        if (ngx_http_push_stream_process_worker_message_data(data)) {
+            pending = 1;
+        }
+    }
+
+    if (pending && !ngx_http_push_stream_ipc_resume_event.posted) {
+#if (nginx_version >= 1017005)
+        ngx_post_event(&ngx_http_push_stream_ipc_resume_event, &ngx_posted_next_events);
+#else
+        ngx_post_event(&ngx_http_push_stream_ipc_resume_event, &ngx_posted_events);
+#endif
     }
 }
 
 
-static ngx_inline void
+static void
+ngx_http_push_stream_ipc_resume_handler(ngx_event_t *ev)
+{
+    ngx_http_push_stream_process_worker_message();
+}
+
+
+/* returns 1 when messages are left in the inbox */
+static ngx_inline ngx_flag_t
 ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t *data)
 {
     ngx_http_push_stream_worker_msg_t      *worker_msg;
     ngx_queue_t                            *cur, *q;
     ngx_slab_pool_t                        *shpool = data->shpool;
     ngx_http_push_stream_worker_data_t     *thisworker_data = data->ipc + ngx_process_slot;
+    ngx_uint_t                              processed = 0;
 
 
     while (!ngx_queue_empty(&thisworker_data->messages_queue)) {
+        if (processed++ >= NGX_HTTP_PUSH_STREAM_IPC_MESSAGES_PER_CALL) {
+            return 1;
+        }
+
         cur = ngx_queue_head(&thisworker_data->messages_queue);
         worker_msg = ngx_queue_data(cur, ngx_http_push_stream_worker_msg_t, queue);
         if (worker_msg->pid == ngx_pid) {
@@ -503,6 +553,8 @@ ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t
         // free worker_msg already sent
         ngx_http_push_stream_free_worker_message_memory(shpool, worker_msg);
     }
+
+    return 0;
 }
 
 

@@ -539,6 +539,238 @@ id/tag w kanale.
 
 ---
 
+## Analiza blokad — 2026-10-09 (`test25`)
+
+Przegląd wszystkich `ngx_shmtx_lock` po wdrożeniu `test25`, pod kątem: co
+dzieje się pod lockiem, czy globalny lock jest trzymany w trakcie czekania na
+inny, co jest O(n) w pętli zdarzeń. Ważne tło: `ngx_shmtx_lock` po krótkim
+spinie śpi w `sem_wait` — **czekający worker nie obsługuje w tym czasie
+niczego** (accept, healthcheck, WS). Każdy punkt poniżej to więc potencjalny
+„stojący worker", jak w incydencie z 2026-10-03.
+
+**Skala (s1, 2026-10-09 ~12:00, 17 min po restarcie, ~7k WS):** 3918 kanałów,
+103 682 wiadomości w buforach, 9137 w koszu, ~210 wiadomości kanałowych/s.
+W szczycie: ~33k WS, wielokrotnie więcej publikacji.
+
+**Kolejność locków (sprawdzona — bez cykli, więc bez deadlocków):**
+`global_shpool` → `channels_to_delete` → `channels_queue` → `channels_trash`
+→ `channel->mutex` → `messages_trash` → `stats` → `shpool`. Problemem nie
+jest zakleszczenie, tylko **długie łańcuchy czekania** (konwoje).
+
+### 🔴 16. Sweep czyszczący trzyma globalny `channels_queue_mutex` przez wszystkie kanały i czeka pod nim na `channel->mutex`  ✅ NAPRAWIONE (branch `test26`)
+
+`collect_expired_messages_data()` (z `memory_cleanup` co 4 s **i** z
+`buffer_cleanup` co 5 s) oraz `collect_expired_messages_and_empty_channels_data()`
+(druga, osobna pętla) chodzą po `data->channels_queue` (3918+ kanałów) pod
+`channels_queue_mutex`, a dla każdego kanału biorą `channel->mutex`
+(`ensure_qtd_of_messages`). Tego samego globalnego mutexu potrzebuje **każda
+publikacja i każda subskrypcja** (`get_channel()`/`find_channel()` per kanał,
+plus licznik `published_messages` w `add_msg_to_channel`). Jeśli którykolwiek
+kanał ma akurat zajęty mutex (publisher formatuje/alokuje 400 KB, slab
+pofragmentowany), sweep czeka **trzymając globalny lock** → wszystkie
+lookupy kanałów na wszystkich workerach stoją.
+
+**Fix:** pod `channels_queue_mutex` tylko skopiować wskaźniki kanałów do
+tablicy (O(n) memcpy, ~4k wskaźników), puścić lock, potem kanał po kanale pod
+`channel->mutex` (pamięć kanału żyje ≥10 s po usunięciu — trash TTL —
+sprawdzać `channel->deleted`); obie pętle scalić w jedną; liczniki
+`published_messages` / `stored_messages` jako `ngx_atomic_fetch_add` zamiast
+`channels_queue_mutex` na gorącej ścieżce publikacji.
+
+### 🟠 17. Sweep kosza trzyma `messages_trash_mutex` przez cały kosz i zwalnianie, a publisher czeka na niego pod `channel->mutex`  ✅ NAPRAWIONE (branch `test26`)
+
+`free_memory_of_expired_messages_and_channels_data()` przechodzi **cały**
+`messages_trash` (od `test24` bez `break`; dziś 9k, w szczycie wielokrotnie
+więcej) i pod tym samym lockiem zwalnia wiadomości (każda: `shpool->mutex`
++ chunki). Jednocześnie `ensure_qtd_of_messages()` — wołane po **każdym**
+`add_msg_to_channel` i trzymające `channel->mutex` — wrzuca wyrzucone
+wiadomości przez `throw_the_message_away()` → `messages_trash_mutex`. Łańcuch:
+sweep kosza → publisher czeka trzymając `channel->mutex` → dostarczanie
+(`ipc.c`) we wszystkich workerach dla kanałów na tym mutexie stoi.
+
+**Fix:** pod `messages_trash_mutex` tylko odpiąć kwalifikujące się wiadomości
+do lokalnej listy, zwalniać po puszczeniu locka; w `ensure_qtd_of_messages`
+zbierać wyrzucane wiadomości lokalnie i `throw_the_message_away` dopiero po
+`ngx_shmtx_unlock(channel->mutex)`.
+
+### 🟠 18. `delete_channels_data()` wysyła i zamyka połączenia pod globalnym `channels_to_delete_mutex`  ✅ NAPRAWIONE (branch `test26`)
+
+Każdy worker (alert `DELETE_CHANNEL` — do wszystkich naraz — oraz timer co
+4 s) pod `channels_to_delete_mutex` iteruje usuwane kanały i dla każdej swojej
+subskrypcji: `send_response_message` (zapis do gniazda) + `finalize`. W prod
+`push_stream_channel_inactivity_delete_with_subscribers on` (do 3 kanałów z
+subskrybentami na sweep). Kanał z tysiącami subskrybentów = 32 workery w
+kolejce do globalnego locka, każdy stoi, aż poprzedni wyśle swoje.
+
+**Fix:** pod lockiem tylko zebrać kanały (+ sentinel workera), puścić,
+wysłać/zamknąć poza lockiem (kanał w `channels_to_delete` nie zostanie
+zwolniony, dopóki `subscribers > 0`).
+
+### 🟠 19. Odbiór IPC opróżnia całą kolejkę w jednym wywołaniu  ✅ NAPRAWIONE (branch `test26`)
+
+`process_worker_message_data()` przetwarza **wszystkie** zaległe wiadomości z
+inboxa workera (każda → zapis do każdego jego subskrybenta kanału) bez
+oddawania pętli zdarzeń. Po każdej przerwie (punkt 16–18, GC, burza) worker
+nadrabia całość ciurkiem — w tym czasie nie przyjmuje połączeń ani nie
+odpowiada na healthcheck.
+
+**Fix:** limit na wywołanie (np. 64 wiadomości albo ~10 ms), resztę przez
+`ngx_post_event` w kolejnym obiegu pętli.
+
+### 🟡 20. Subskrypcja przechodzi bufor kanału (do 512) pod `channel->mutex` dwa razy
+
+`has_old_messages_to_send()` + `send_old_messages()` (od `test23` wysyłka już
+poza lockiem, ale samo przejście listy nie) — przy `startup_message` jeszcze
+raz. Burza reconnectów na popularnym kanale = dziesiątki tysięcy przejść
+seryjnie na jednym mutexie, blokując też publikacje do kanału.
+
+**Fix:** jedno przejście zamiast dwóch; szukanie `Last-Event-Id` od końca
+(najnowsze — klient zwykle jest prawie na bieżąco). Konfiguracyjnie:
+rozważyć mniejsze `push_stream_max_messages_stored_per_channel` (dziś 512,
+średnio 26 w buforze na kanał).
+
+### 🟡 21. Jeden globalny `stats_mutex` na każdą subskrypcję i snapshot statystyk pod nim
+
+`stat_subscription_register/unregister` (per kanał subskrypcji, przy
+`per=channel`) — lookup w rbtree + ewentualny alloc pod globalnym
+`stats_mutex`; endpoint `push_stream_stats_dimensions` kopiuje **wszystkie**
+buckety (z 2× `ngx_pnalloc` na wiersz) pod tym samym lockiem — przy
+scrapowaniu przez Netdatę co kilka sekund i dużej liczbie kluczy blokuje
+subskrypcje na wszystkich workerach.
+
+**Fix:** snapshot do jednego bufora (jedna alokacja), bez sortowania pod
+lockiem (już jest poza); ewentualnie sharding `stats_mutex` po hashu grupy.
+
+### 🟡 22. Census subskrybentów przy starcie workera: O(workery² × kanały) pod globalnymi lockami
+
+`ipc_init_worker()` wysyła census do **wszystkich** workerów; każdy census
+idzie po wszystkich kanałach pod `global_shpool->mutex` +
+`channels_queue_mutex` (+ każdy `channel->mutex`), ostatni jeszcze raz. Przy
+reloadzie 32 nowych workerów = 32 × 32 przejść po ~4k kanałów. Tylko
+reload/respawn, ale właśnie wtedy i tak trwa burza reconnectów.
+
+**Fix:** census tylko w nowym workerze (pozostałe nie zmieniły stanu) albo
+debounce (jeden census po ustaniu startów).
+
+### 🟢 23. Odczyt głowy inboxa IPC bez locka
+
+`process_worker_message_data()` czyta `ngx_queue_empty/head` bez
+`shpool->mutex`, a producenci wstawiają pod nim. Na x86 (TSO) i przy tym, że
+pola wiadomości są ustawione przed `insert_tail`, w praktyce bezpieczne;
+do odnotowania przy przenoszeniu na ARM.
+
+### 🟢 24. Pozostały koszt publikacji pod `channel->mutex`
+
+Formatowanie szablonu (memcpy ciała) + alokacje w shm na kanał
+(punkt 15, „do rozważenia dalej"). Po `test25` ~1 ms na kanał przy 400 KB.
+
+### Proponowana kolejność
+
+0. **Najpierw pomiar** — instrumentacja locków: makro wokół
+   `ngx_shmtx_lock/unlock` mierzące czas czekania i trzymania
+   (`clock_gettime(CLOCK_MONOTONIC)`), log `WARN` z nazwą locka i miejscem
+   przy przekroczeniu progu (dyrektywa np. `push_stream_lock_slow_log 20ms`,
+   domyślnie off). W szczycie pokaże, które z 16–22 realnie stoją.
+1. 16 + 17 — największy zasięg (globalny lock na gorącej ścieżce publikacji
+   i subskrypcji, łańcuch do `channel->mutex`); zmiany lokalne, testowalne.
+2. 19 — prosty, poprawia sprawiedliwość pętli zdarzeń po każdej przerwie.
+3. 18 — przy `inactivity_delete_with_subscribers on`.
+4. 20–22 wg wyników pomiaru.
+
+### Wynik `test26` (2026-10-09)
+
+Zrobione 16–19 (bez instrumentacji z pkt 0 i bez 20–24):
+
+- **16** — `ngx_http_push_stream_snapshot_channels()`: pod
+  `channels_queue_mutex` tylko kopia wskaźników do per-workerowego bufora
+  (`ngx_http_push_stream_ptr_buf_t`, rośnie wg liczników + zapas); obie pętle
+  (`collect_expired_messages_data`, `..._and_empty_channels_data`) na jednym
+  snapshocie; wygaszanie wiadomości przez `ensure_qtd_of_messages(..., try_lock=1)`
+  — zajęty kanał pominięty do następnego sweepu, worker nie zasypia; przeniesienie
+  pustego kanału do kosza: wstępny test bez locka, ponowny pod
+  `channels_queue_mutex` tylko dla kandydatów. Wskaźniki są bezpieczne: kanał
+  zwalnia tylko posiadacz `cleanup_mutex` (sweepy nim są), ≥10 s po trafieniu
+  do kosza; sprawdzane `channel->deleted`.
+- **17** — `ensure_qtd_of_messages`: wyrzucone wiadomości odpinane do
+  lokalnej listy, `throw_the_message_away()` dopiero po puszczeniu
+  `channel->mutex`; sweep kosza pod `messages_trash_mutex` tylko odpina
+  kwalifikujące się, `free_message_memory()` po puszczeniu.
+- **18** — `delete_channels_data`: szybki test pustej kolejki bez locka (to
+  przypadek prawie każdego ticku 4 s w każdym workerze), kopia kanałów pod
+  `channels_to_delete_mutex`, wysyłka/`finalize` po puszczeniu.
+- **19** — inbox IPC: max 32 wiadomości na wywołanie, reszta przez
+  `ngx_posted_next_events` (następny obieg pętli, po gotowym I/O).
+
+Testy lokalne (nginx 1.31.6, 1 i 8 workerów, `-Wall -Werror`): regresja
+permessage-deflate z punktu 15 OK; nowy test funkcjonalny OK —
+wyrzucanie ponad `max_messages_stored_per_channel` + backtrack w kolejności,
+wygaszanie (`stored_messages` → 0), opróżnianie kosza (`messages_in_trash` →
+0), usuwanie pustego bezczynnego kanału, `DELETE` kanału z 16 subskrybentami
+na różnych workerach (wszyscy rozłączeni, `channels_in_delete` → 0), 100
+wiadomości naraz w jednym inboxie (1 worker → na pewno > 32) dostarczone w
+kolejności, `inactivity_delete_with_subscribers`. Przy okazji: limit 3 kanałów
+z subskrybentami na sweep (`NGX_PS_MAX_DELETE_BATCH`) przy 1 workerze i 100+
+bezczynnych kanałach daje opóźnienie usunięcia > 2 min — tak samo w `test25`,
+bez zmian.
+
+Pomiar (8 workerów, 200k kanałów × 5 wiadomości wygasających w trakcie,
+10k wiad./s dopełnienia + 5×/s 54 KiB → 100 kanałów, opóźnienie małej
+publikacji POST → odbiór WS, 3 rundy × 40 s): p99 **13,5–15,7 ms → 12,1–13,0
+ms**, próbek > 20 ms **24–33 → 14–24**; p50 bez zmian (~1,3 ms), maksima w
+szumie (WSL, klient i nginx na tych samych 8 rdzeniach). Przy 20k kanałów
+różnicy brak — sweep jest za krótki, żeby blokować. Zysk lokalnie umiarkowany;
+zmiany usuwają przede wszystkim najgorsze łańcuchy (globalny lock trzymany w
+trakcie czekania na `channel->mutex` / zwalniania pamięci), których lokalny
+test nie odtwarza w pełni — weryfikacja w szczycie na produkcji.
+
+### Plan dalszych prac (2026-10-09)
+
+**Endpointy statusu — nie są problemem** (zmierzone na s1, ~3,9k kanałów):
+
+| Kto | Co | Częstotliwość | Koszt |
+|---|---|---|---|
+| healthcheck Dockera | `/healthz` (`return 200`, `access_log off`) | co 30 s | pomijalny |
+| `push-stats-exporter` (Netdata) | `/system-tools/push/stats` (summary) | co 15 s × s1–s3 | 2 KB, odczyty bez locków (shm gauge cache'owany od `test23`) |
+| `push-stats-exporter` | `?ch=ALL` | co 15 s | 521 KB / 19 ms; `channels_queue_mutex` ~1 ms (walk kanałów), reszta to budowa JSON-a na jednym workerze |
+| exporter + admin `Stat.class.php` | `stats-dimensions` | co 15 s / na żądanie | 25 KB, kopia pod `stats_mutex` |
+
+Ułamek procenta jednego workera — nie ruszać, dopóki pomiar w szczycie nie
+pokaże inaczej. `?ch=ALL` jest potrzebne (exporter buduje statystyki z nazw
+kanałów: język / strefa / sort). Drobiazg do poprawki przy okazji:
+`send_response_all_channels_info_detailed()` czyta `channel->id.data` z shm
+po puszczeniu locka — w praktyce bezpieczne (TTL kosza 10 s), ale lepiej
+kopiować id pod lockiem albo użyć snapshotu z punktu 16.
+
+**Kolejność (od najważniejszego):**
+
+1. **Wdrożyć `test26` i zmierzyć w szczycie** (weekend ~16:00): liczba
+   `Health check ... context deadline exceeded`/dobę na s1–s3, `pidstat` na
+   workerach, ostrzeżenia emittera `Live publish: nginx not reachable`.
+   Przy okazji potwierdzić, że obraz zawiera pulę 64 mutexów (commit
+   `9942092` jest na `test25`, z binarki nie widać).
+2. **Zmierzyć rozmiary patchy emittera** — dziś nieznane (testy zakładały
+   54–409 KiB). `$request_length` w formacie logu `socket_publish.log`
+   (`docker-setup/containers/nginx/config/snippets/push_publisher.conf`).
+   Jeśli patche są małe, punkty 4 i 5 tracą wagę.
+3. **Instrumentacja locków** (punkt 0 analizy): makro wokół
+   `ngx_shmtx_lock/unlock` mierzące czekanie i trzymanie, log z nazwą locka
+   i miejscem powyżej progu z dyrektywy (domyślnie off). Kolejne poprawki
+   dopiero na podstawie tych danych.
+4. **Emitter: jedno połączenie keep-alive = jeden worker nginx** robi całą
+   publikację (POST 409 KiB × 100 kanałów ≈ 100 ms jego pętli zdarzeń).
+   Po stronie PHP (`kscms.v07/api/.../Emit/Workers/EmitWorker.php`): kilka
+   połączeń albo mniejsze chunki niż 100 kanałów — tańsze niż zmiany w module.
+5. **Punkt 24** — formatowanie szablonu + alokacje w shm per kanał pod
+   `channel->mutex` (~1 ms/kanał przy 400 KB); wymaga zachowania kolejności
+   id/tag w kanale.
+6. **Punkt 20** — subskrypcja: jedno przejście bufora zamiast dwóch, szukanie
+   `Last-Event-Id` od końca; liczy się przy burzy reconnectów.
+7. Mniejsze: 21 (`stats_mutex` przy każdej subskrypcji), 22 (census przy
+   reloadzie), 8 (`r->pool` rośnie z komendami WS), 12 (wysyłka > 16 KB
+   w kawałkach per subskrybent).
+
+---
+
 ## Zmiany będące plusami przy tej skali (dla równowagi)
 
 - `broadcast()`: IPC alerty (`ngx_write_channel`) wyniesione poza `channel->mutex`
