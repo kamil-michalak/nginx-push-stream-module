@@ -1374,8 +1374,9 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_ERROR;
     }
 
-    u_char lock_name[25];
-    for (i = 0; i < 10; i++) {
+    /* "push_stream_channels_" + up to 20 digits + NUL */
+    u_char lock_name[48];
+    for (i = 0; i < NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES; i++) {
         ngx_sprintf(lock_name, "push_stream_channels_%d%Z", i);
         if (ngx_http_push_stream_create_shmtx(&d->channels_mutex[i], &d->channels_lock[i], lock_name) != NGX_OK) {
             return NGX_ERROR;

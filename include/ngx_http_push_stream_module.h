@@ -35,6 +35,18 @@
 #include <zlib.h>
 #endif
 
+/* size of the shared channel mutex pool (channels_mutex[] in shm, handed out
+   round-robin as channels are created). Unrelated channels sharing a mutex
+   wait on each other: a publish holds its channel's mutex while it formats
+   and stores the message, and every worker takes it to deliver, subscribe
+   and clean up - with the original 10, a 100-channel publish kept every
+   mutex busy in turn. A compile-time constant on purpose: the array lives in
+   the shm struct that a reload reuses as-is. Each entry is a few dozen bytes
+   of shm plus one POSIX semaphore. Override with -D at build time. */
+#ifndef NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES
+#define NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES 64
+#endif
+
 /* minimum payload size (bytes) worth compressing - frames smaller than this
    are sent as-is even to deflate-enabled clients */
 #define NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN 200
@@ -572,8 +584,8 @@ struct ngx_http_push_stream_shm_data_s {
     ngx_slab_pool_t                        *shpool;
     ngx_uint_t                              slots_for_census;
     ngx_uint_t                              mutex_round_robin;
-    ngx_shmtx_t                             channels_mutex[10];
-    ngx_shmtx_sh_t                          channels_lock[10];
+    ngx_shmtx_t                             channels_mutex[NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES];
+    ngx_shmtx_sh_t                          channels_lock[NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES];
     ngx_shmtx_t                             cleanup_mutex;
     ngx_shmtx_sh_t                          cleanup_lock;
     ngx_shmtx_t                             events_channel_mutex;

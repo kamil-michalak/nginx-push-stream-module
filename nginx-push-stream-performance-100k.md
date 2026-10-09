@@ -526,9 +526,16 @@ wiadomość) == klient bez kompresji dla: małej wiadomości (bez RSV1), 4 KB i
 409 KiB JSON (64-bit długość ramki), base64, prefiksu > 65535 B (długi
 `Event-Id`), `Startup-Message`; poziomy 6 i 1.
 
-**Do rozważenia dalej:** więcej niż 10 mutexów kanałów (np. 64) — mniejsza
-szansa, że różne kanały czekają na siebie; formatowanie szablonu (memcpy N×
-ciało) też dałoby się wynieść poza lock.
+- **Pula mutexów kanałów 10 → 64** (`NGX_HTTP_PUSH_STREAM_CHANNEL_MUTEXES`,
+  stała kompilacji, nadpisywalna `-D` — tablica siedzi w strukturze shm
+  reużywanej przy reloadzie). Lokalnie (8 workerów, małe publikacje na 10
+  kanałach w trakcie publikacji do 100 kanałów) różnica w granicach szumu, bo
+  po wyniesieniu deflate lock trzymany jest przez dziesiątki µs; zostawione
+  jako tanie zabezpieczenie na produkcyjny fan-out (32 workery, ~33k WS).
+
+**Do rozważenia dalej:** formatowanie szablonu (memcpy N× ciało) i alokacje
+w shm też dałoby się wynieść poza lock — wymaga zachowania kolejności
+id/tag w kanale.
 
 ---
 
