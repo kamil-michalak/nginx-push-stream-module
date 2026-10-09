@@ -41,6 +41,10 @@ static ngx_conf_enum_t  ngx_http_push_stream_ping_modes[] = {
     { ngx_null_string, 0 }
 };
 
+static ngx_conf_num_bounds_t  ngx_http_push_stream_websocket_deflate_level_bounds = {
+    ngx_conf_check_num_bounds, 1, 9
+};
+
 static ngx_command_t    ngx_http_push_stream_commands[] = {
     { ngx_string("push_stream_channels_statistics"),
         NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
@@ -328,6 +332,12 @@ static ngx_command_t    ngx_http_push_stream_commands[] = {
         NGX_HTTP_MAIN_CONF_OFFSET,
         offsetof(ngx_http_push_stream_main_conf_t, stat_max_keys),
         NULL },
+    { ngx_string("push_stream_websocket_deflate_level"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_push_stream_main_conf_t, websocket_deflate_level),
+        &ngx_http_push_stream_websocket_deflate_level_bounds },
     { ngx_string("push_stream_stats_dimensions"),
         NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
         ngx_http_push_stream_stats_dimensions,
@@ -584,6 +594,7 @@ ngx_http_push_stream_create_main_conf(ngx_conf_t *cf)
     ngx_str_null(&mcf->events_channel_id);
     mcf->longpooling_timeout_msg = NULL;
     mcf->stat_max_keys = NGX_CONF_UNSET_UINT;
+    mcf->websocket_deflate_level = NGX_CONF_UNSET;
     ngx_queue_init(&mcf->msg_templates);
 
     return mcf;
@@ -603,6 +614,8 @@ ngx_http_push_stream_init_main_conf(ngx_conf_t *cf, void *parent)
     ngx_conf_init_value(conf->channel_inactivity_time, NGX_HTTP_PUSH_STREAM_DEFAULT_CHANNEL_INACTIVITY_TIME);
     ngx_conf_init_value(conf->channel_inactivity_delete_with_subscribers, 0);
     ngx_conf_init_uint_value(conf->stat_max_keys, NGX_HTTP_PUSH_STREAM_STAT_DEFAULT_MAX_KEYS);
+    /* 6 = zlib's Z_DEFAULT_COMPRESSION, what the cached frames always used */
+    ngx_conf_init_value(conf->websocket_deflate_level, 6);
     ngx_conf_merge_str_value(conf->channel_deleted_message_text, conf->channel_deleted_message_text, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_TEXT);
     ngx_conf_merge_str_value(conf->wildcard_channel_prefix, conf->wildcard_channel_prefix, NGX_HTTP_PUSH_STREAM_DEFAULT_WILDCARD_CHANNEL_PREFIX);
     ngx_conf_merge_str_value(conf->events_channel_id, conf->events_channel_id, NGX_HTTP_PUSH_STREAM_DEFAULT_EVENTS_CHANNEL_ID);

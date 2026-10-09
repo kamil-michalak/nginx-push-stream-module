@@ -790,19 +790,20 @@ ngx_http_push_stream_apply_text_template(ngx_str_t **dst_value, ngx_str_t **dst_
  *
  * Reusing one stream avoids the deflateInit2()/deflateEnd() workspace
  * alloc+free (~256 KB with windowBits 15 / memLevel 8) that the publish path
- * would otherwise pay on EVERY published message - and N times for a single
- * wildcard fan-out publish - all while holding channel->mutex.
+ * would otherwise pay on EVERY published message.
  *
  * nginx workers are separate processes, single-threaded on the event loop,
  * so this file-scope pointer is naturally per-worker and needs no locking.
- * ngx_http_push_stream_deflate_stream_cleanup() (called from
+ * The level (push_stream_websocket_deflate_level) is a main-conf value, fixed
+ * for the lifetime of a worker - a reload starts new workers with a fresh
+ * stream. ngx_http_push_stream_deflate_stream_cleanup() (called from
  * ngx_http_push_stream_exit_worker) tears it down; a missed teardown just
  * leaves the OS to reclaim it at process exit.
  */
 static z_stream *ngx_http_push_stream_deflate_zs = NULL;
 
 static z_stream *
-ngx_http_push_stream_get_deflate_stream(void)
+ngx_http_push_stream_get_deflate_stream(ngx_int_t level)
 {
     if (ngx_http_push_stream_deflate_zs != NULL) {
         if (deflateReset(ngx_http_push_stream_deflate_zs) == Z_OK) {
@@ -821,7 +822,7 @@ ngx_http_push_stream_get_deflate_stream(void)
     ngx_memzero(ngx_http_push_stream_deflate_zs, sizeof(z_stream));
 
     /* windowBits = -15: raw deflate, no zlib header or trailer (RFC 7692) */
-    if (deflateInit2(ngx_http_push_stream_deflate_zs, Z_DEFAULT_COMPRESSION,
+    if (deflateInit2(ngx_http_push_stream_deflate_zs, (int) level,
                      Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
         ngx_free(ngx_http_push_stream_deflate_zs);
         ngx_http_push_stream_deflate_zs = NULL;
@@ -842,6 +843,66 @@ ngx_http_push_stream_deflate_stream_cleanup(void)
 }
 
 /*
+ * Raw-deflate `len` bytes as one self-contained SEGMENT: a fresh stream
+ * (no back-references to anything before it), flushed with Z_SYNC_FLUSH and
+ * NOT trimmed - so it never sets BFINAL and ends byte-aligned with the
+ * empty stored block 00 00 FF FF. Such segments can be concatenated with each
+ * other and with stored blocks into one valid deflate stream, which is what
+ * ngx_http_push_stream_deflate_websocket_frame_spliced() relies on.
+ *
+ * Returns the segment allocated from temp_pool, or NULL on any allocation /
+ * zlib error (including an output buffer that turned out too small - a
+ * partial segment would decode as garbage, so it is never returned).
+ */
+static ngx_str_t *
+ngx_http_push_stream_deflate_segment(ngx_int_t level, const u_char *data, size_t len,
+    ngx_pool_t *temp_pool)
+{
+    ngx_str_t  *segment;
+    z_stream   *zs;
+    uLong       bound;
+
+    if ((zs = ngx_http_push_stream_get_deflate_stream(level)) == NULL) {
+        return NULL;
+    }
+
+    /* deflateBound() covers Z_FINISH; Z_SYNC_FLUSH adds at most an empty
+       stored block (block header + 4 bytes) on top of it */
+    bound = deflateBound(zs, (uLong) len) + 16;
+
+    if ((segment = ngx_palloc(temp_pool, sizeof(ngx_str_t) + bound)) == NULL) {
+        return NULL;
+    }
+    segment->data = (u_char *) (segment + 1);
+
+    zs->next_in   = (Bytef *) data;
+    zs->avail_in  = (uInt) len;
+    zs->next_out  = segment->data;
+    zs->avail_out = (uInt) bound;
+
+    /* NO deflateEnd here - the stream is reused; the next call resets it */
+    if ((deflate(zs, Z_SYNC_FLUSH) != Z_OK) || (zs->avail_in != 0) || (zs->avail_out == 0)) {
+        return NULL;
+    }
+
+    segment->len = bound - zs->avail_out;
+
+    return segment;
+}
+
+/* RFC 7692 s.7.2.1: a message ends with the 00 00 FF FF of Z_SYNC_FLUSH,
+   which the sender removes and the receiver appends back before inflating */
+static ngx_flag_t
+ngx_http_push_stream_deflate_has_sync_tail(const u_char *data, size_t len)
+{
+    return (len >= 4
+            && data[len - 4] == 0x00
+            && data[len - 3] == 0x00
+            && data[len - 2] == (u_char) 0xFF
+            && data[len - 1] == (u_char) 0xFF);
+}
+
+/*
  * Compress plain WebSocket payload with raw deflate (RFC 7692 permessage-deflate).
  * Uses server_no_context_takeover (see ngx_http_push_stream_get_deflate_stream):
  * the shared per-worker z_stream is reset per message so the resulting bytes
@@ -855,65 +916,178 @@ ngx_http_push_stream_deflate_stream_cleanup(void)
  *   - any allocation / zlib error occurs
  */
 static ngx_str_t *
-ngx_http_push_stream_deflate_websocket_frame(const u_char *payload, off_t payload_len,
+ngx_http_push_stream_deflate_websocket_frame(ngx_int_t level, const u_char *payload, off_t payload_len,
     ngx_pool_t *temp_pool)
 {
-    uLong      bound;
-    u_char    *deflated;
-    z_stream  *zs;
-    int        ret;
-    uLong      compressed_len;
+    ngx_str_t  *segment;
+    size_t      compressed_len;
 
     if (payload_len < NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN) {
         return NULL;
     }
 
-    bound = compressBound(payload_len);
-    if ((deflated = ngx_palloc(temp_pool, bound)) == NULL) {
+    if ((segment = ngx_http_push_stream_deflate_segment(level, payload, (size_t) payload_len, temp_pool)) == NULL) {
         return NULL;
     }
 
-    if ((zs = ngx_http_push_stream_get_deflate_stream()) == NULL) {
-        return NULL;
-    }
-
-    zs->next_in   = (Bytef *) payload;
-    zs->avail_in  = (uInt) payload_len;
-    zs->next_out  = deflated;
-    zs->avail_out = (uInt) bound;
-
-    /* NO deflateEnd here - the stream is reused; the next call resets it */
-    ret = deflate(zs, Z_SYNC_FLUSH);
-
-    if (ret != Z_OK && ret != Z_BUF_ERROR) {
-        return NULL;
-    }
-
-    compressed_len = bound - zs->avail_out;
-
-    /* RFC 7692 s.7.2.1: remove trailing 00 00 FF FF added by Z_SYNC_FLUSH */
-    if (compressed_len >= 4
-        && deflated[compressed_len - 4] == 0x00
-        && deflated[compressed_len - 3] == 0x00
-        && deflated[compressed_len - 2] == (u_char) 0xFF
-        && deflated[compressed_len - 1] == (u_char) 0xFF)
-    {
+    compressed_len = segment->len;
+    if (ngx_http_push_stream_deflate_has_sync_tail(segment->data, compressed_len)) {
         compressed_len -= 4;
     }
 
     /* only use compressed version if it actually saves bytes */
-    if (compressed_len >= (uLong) payload_len) {
+    if (compressed_len >= (size_t) payload_len) {
         return NULL;
     }
 
     return ngx_http_push_stream_get_formatted_websocket_frame(
         &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_DEFLATE_BYTE, 1,
-        deflated, (off_t) compressed_len, temp_pool);
+        segment->data, (off_t) compressed_len, temp_pool);
+}
+
+/* a websocket template whose permessage-deflate frame can be spliced from
+   a body compressed once per publish: exactly one ~text~, no per-line
+   (eventsource) formatting of it */
+static ngx_flag_t
+ngx_http_push_stream_template_splices_text(ngx_http_push_stream_template_t *template)
+{
+    return (template->websocket && template->websocket_permessage_deflate
+            && !template->eventsource && (template->qtd_text == 1));
+}
+
+/* deflate stored blocks are capped at 65535 bytes each */
+#define NGX_HTTP_PUSH_STREAM_DEFLATE_STORED_MAX  65535
+
+static size_t
+ngx_http_push_stream_deflate_stored_size(size_t len)
+{
+    return len + 5 * ((len + NGX_HTTP_PUSH_STREAM_DEFLATE_STORED_MAX - 1) / NGX_HTTP_PUSH_STREAM_DEFLATE_STORED_MAX);
+}
+
+/*
+ * Write `len` bytes as non-final deflate stored blocks. Must start on a byte
+ * boundary (true at stream start and right after a Z_SYNC_FLUSH segment):
+ * the 3 header bits BFINAL=0 / BTYPE=00 plus padding are one 0x00 byte,
+ * followed by LEN and NLEN (little endian) and the bytes themselves.
+ */
+static u_char *
+ngx_http_push_stream_deflate_write_stored(u_char *dst, const u_char *src, size_t len)
+{
+    size_t  n;
+
+    while (len > 0) {
+        n = ngx_min(len, NGX_HTTP_PUSH_STREAM_DEFLATE_STORED_MAX);
+        *dst++ = 0x00;
+        *dst++ = (u_char) (n & 0xFF);
+        *dst++ = (u_char) ((n >> 8) & 0xFF);
+        *dst++ = (u_char) (~n & 0xFF);
+        *dst++ = (u_char) ((~n >> 8) & 0xFF);
+        dst = ngx_cpymem(dst, src, n);
+        src += n;
+        len -= n;
+    }
+
+    return dst;
+}
+
+/*
+ * Build the permessage-deflate frame for a formatted message whose ~text~
+ * part was already compressed ONCE for the whole publish (deflated_text, see
+ * ngx_http_push_stream_deflate_publish_text) instead of deflating the whole
+ * formatted message again for every channel - while holding channel->mutex,
+ * which other workers need to deliver messages of every channel sharing it.
+ *
+ * formatted = prefix + text + suffix, where prefix/suffix are the per-channel
+ * template parts (~id~, ~tag~, ~time~, ~channel~, literals...). The payload is
+ *     stored(prefix) + deflated_text + stored(suffix) + 0x00
+ * deflated_text is a self-contained Z_SYNC_FLUSH segment, so it starts and
+ * ends byte-aligned and references nothing outside itself. The trailing 0x00
+ * is the header byte of a final empty stored block whose 00 00 FF FF the
+ * receiver appends (RFC 7692 s.7.2.2), exactly as if the sender had flushed
+ * and trimmed it. Prefix/suffix stay uncompressed - a few dozen bytes.
+ *
+ * Same NULL contract as ngx_http_push_stream_deflate_websocket_frame().
+ */
+static ngx_str_t *
+ngx_http_push_stream_deflate_websocket_frame_spliced(ngx_str_t *formatted, size_t text_offset,
+    size_t text_len, ngx_str_t *deflated_text, ngx_pool_t *temp_pool)
+{
+    u_char     *payload, *last;
+    size_t      prefix_len, suffix_len, payload_len;
+    ngx_str_t  *frame;
+
+    if (formatted->len < NGX_HTTP_PUSH_STREAM_WEBSOCKET_DEFLATE_MIN_LEN) {
+        return NULL;
+    }
+
+    if ((text_offset > formatted->len) || (text_len > formatted->len - text_offset)) {
+        return NULL;
+    }
+
+    prefix_len = text_offset;
+    suffix_len = formatted->len - text_offset - text_len;
+
+    payload_len = ngx_http_push_stream_deflate_stored_size(prefix_len)
+                + deflated_text->len
+                + ngx_http_push_stream_deflate_stored_size(suffix_len)
+                + 1;
+
+    /* only use compressed version if it actually saves bytes */
+    if (payload_len >= formatted->len) {
+        return NULL;
+    }
+
+    if ((payload = ngx_palloc(temp_pool, payload_len)) == NULL) {
+        return NULL;
+    }
+
+    last = ngx_http_push_stream_deflate_write_stored(payload, formatted->data, prefix_len);
+    last = ngx_cpymem(last, deflated_text->data, deflated_text->len);
+    last = ngx_http_push_stream_deflate_write_stored(last, formatted->data + text_offset + text_len, suffix_len);
+    *last++ = 0x00;
+
+    frame = ngx_http_push_stream_get_formatted_websocket_frame(
+        &NGX_HTTP_PUSH_STREAM_WEBSOCKET_TEXT_LAST_FRAME_DEFLATE_BYTE, 1,
+        payload, (off_t) (last - payload), temp_pool);
+
+    return frame;
 }
 #endif /* NGX_HAVE_ZLIB */
 
+/*
+ * Compress a published message body ONCE, before it is added to its
+ * channel(s): the result is handed to every add_msg_to_channel() /
+ * convert_char_to_msg_on_shared() call of that publish, which then only
+ * splice it between the per-channel template parts. Runs with no lock held.
+ *
+ * Returns NULL (callers fall back to compressing per channel / sending plain
+ * frames) when no permessage-deflate websocket template can use it - i.e. no
+ * template with exactly one ~text~ - or on any compression failure.
+ */
+ngx_str_t *
+ngx_http_push_stream_deflate_publish_text(ngx_http_push_stream_main_conf_t *mcf, const u_char *data,
+    size_t len, ngx_pool_t *temp_pool)
+{
+#if (NGX_HAVE_ZLIB)
+    ngx_queue_t  *q;
+
+    if (len == 0) {
+        return NULL;
+    }
+
+    for (q = ngx_queue_head(&mcf->msg_templates); q != ngx_queue_sentinel(&mcf->msg_templates); q = ngx_queue_next(q)) {
+        ngx_http_push_stream_template_t *cur = ngx_queue_data(q, ngx_http_push_stream_template_t, queue);
+        if (ngx_http_push_stream_template_splices_text(cur)) {
+            return ngx_http_push_stream_deflate_segment(mcf->websocket_deflate_level, data, len, temp_pool);
+        }
+    }
+#endif
+
+    return NULL;
+}
+
 ngx_http_push_stream_msg_t *
-ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content)
+ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_conf_t *mcf, u_char *data, size_t len, ngx_http_push_stream_channel_t *channel, ngx_int_t id, ngx_str_t *event_id, ngx_str_t *event_type, time_t time, ngx_int_t tag, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content, ngx_str_t *deflated_text)
 {
     ngx_slab_pool_t                           *shpool = mcf->shpool;
     ngx_queue_t                               *q;
@@ -1020,6 +1194,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
     for (q = ngx_queue_head(&mcf->msg_templates); q != ngx_queue_sentinel(&mcf->msg_templates); q = ngx_queue_next(q)) {
         ngx_http_push_stream_template_t *cur = ngx_queue_data(q, ngx_http_push_stream_template_t, queue);
         ngx_str_t *aux = NULL;
+        size_t     text_offset = (size_t) -1;
         if (cur->eventsource) {
             ngx_http_push_stream_line_t     *cur_line;
             ngx_queue_t                     *lines, *q_line;
@@ -1031,7 +1206,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
 
             for (q_line = ngx_queue_head(lines); q_line != ngx_queue_sentinel(lines); q_line = ngx_queue_next(q_line )) {
                 cur_line = ngx_queue_data(q_line , ngx_http_push_stream_line_t, queue);
-                if ((cur_line->line = ngx_http_push_stream_format_message(channel, msg, cur_line->line, cur, temp_pool)) == NULL) {
+                if ((cur_line->line = ngx_http_push_stream_format_message(channel, msg, cur_line->line, cur, temp_pool, NULL)) == NULL) {
                     break;
                 }
             }
@@ -1041,7 +1216,7 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
                 ngx_sprintf(aux->data, "%V\n", tmp);
             }
         } else {
-            aux = ngx_http_push_stream_format_message(channel, msg, &original_data, cur, temp_pool);
+            aux = ngx_http_push_stream_format_message(channel, msg, &original_data, cur, temp_pool, &text_offset);
         }
 
         if (aux == NULL) {
@@ -1071,10 +1246,21 @@ ngx_http_push_stream_convert_char_to_msg_on_shared(ngx_http_push_stream_main_con
            also build and cache a compressed frame - skipped entirely when
            push_stream_websocket_permessage_deflate is off everywhere that uses
            this template, so those setups pay no publish-time compression cost
-           and store no second copy in shared memory */
+           and store no second copy in shared memory.
+           When the caller compressed the body once for the whole publish
+           (deflated_text) and the ~text~ part could be located, only splice
+           it between the per-channel template parts - no deflate() here,
+           which add_msg_to_channel() runs while holding channel->mutex. */
         if (cur->websocket && cur->websocket_permessage_deflate) {
-            ngx_str_t *compressed = ngx_http_push_stream_deflate_websocket_frame(
-                aux->data, aux->len, temp_pool);
+            ngx_str_t *compressed;
+            if ((deflated_text != NULL) && ngx_http_push_stream_template_splices_text(cur)
+                && (text_offset != (size_t) -1)) {
+                compressed = ngx_http_push_stream_deflate_websocket_frame_spliced(
+                    aux, text_offset, len, deflated_text, temp_pool);
+            } else {
+                compressed = ngx_http_push_stream_deflate_websocket_frame(
+                    mcf->websocket_deflate_level, aux->data, aux->len, temp_pool);
+            }
             if (compressed != NULL) {
                 ngx_str_t *comp_slot = (msg->compressed_messages + i);
                 if (ngx_http_push_stream_alloc_content(shpool, compressed->data, compressed->len,
@@ -1144,7 +1330,7 @@ ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, 
        so two workers racing to build the same text can't both succeed and
        leak one of the two results */
     if ((msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text->data, text->len, NULL,
-            NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL)) == NULL) {
+            NGX_HTTP_PUSH_STREAM_PING_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL, NULL)) == NULL) {
         ngx_shmtx_unlock(&data->ping_msgs_mutex);
         return NULL;
     }
@@ -1176,7 +1362,7 @@ ngx_http_push_stream_get_shared_ping_msg(ngx_http_push_stream_main_conf_t *mcf, 
 
 
 ngx_int_t
-ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content)
+ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t *log, ngx_http_push_stream_channel_t *channel, u_char *text, size_t len, ngx_str_t *event_id, ngx_str_t *event_type, ngx_str_t *message_ttl_header, ngx_flag_t store_messages, ngx_pool_t *temp_pool, ngx_http_push_stream_shared_raw_content_t *shared_raw_content, ngx_str_t *deflated_text)
 {
     ngx_http_push_stream_shm_data_t        *data = mcf->shm_data;
     ngx_http_push_stream_msg_t             *msg;
@@ -1224,7 +1410,7 @@ ngx_http_push_stream_add_msg_to_channel(ngx_http_push_stream_main_conf_t *mcf, n
     ngx_shmtx_unlock(&data->shpool->mutex);
 
     // create a buffer copy in shared mem
-    msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, id, event_id, event_type, time, tag, temp_pool, shared_raw_content);
+    msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, id, event_id, event_type, time, tag, temp_pool, shared_raw_content, deflated_text);
     if (msg == NULL) {
         ngx_shmtx_unlock(channel->mutex);
         ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: unable to allocate message in shared memory");
@@ -1293,7 +1479,7 @@ ngx_http_push_stream_send_event(ngx_http_push_stream_main_conf_t *mcf, ngx_log_t
         ngx_str_t *event = ngx_http_push_stream_create_str(temp_pool, len);
         if (event != NULL) {
             ngx_sprintf(event->data, NGX_HTTP_PUSH_STREAM_EVENT_TEMPLATE, event_type, &channel->id);
-            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, NULL, 1, temp_pool, NULL);
+            ngx_http_push_stream_add_msg_to_channel(mcf, log, data->events_channel, event->data, ngx_strlen(event->data), NULL, event_type, NULL, 1, temp_pool, NULL, NULL);
         }
 
         if ((received_temp_pool == NULL) && (temp_pool != NULL)) {
@@ -1808,7 +1994,7 @@ ngx_http_push_stream_send_response_finalize_for_longpolling_by_timeout(ngx_http_
 
     if (mcf->timeout_with_body && (mcf->longpooling_timeout_msg == NULL)) {
         // create longpooling timeout message
-        if ((mcf->longpooling_timeout_msg == NULL) && (mcf->longpooling_timeout_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, (u_char *) NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT, ngx_strlen(NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT), NULL, NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_ID, NULL, NULL, 0, 0, r->pool, NULL)) == NULL) {
+        if ((mcf->longpooling_timeout_msg == NULL) && (mcf->longpooling_timeout_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, (u_char *) NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT, ngx_strlen(NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_TEXT), NULL, NGX_HTTP_PUSH_STREAM_LONGPOOLING_TIMEOUT_MESSAGE_ID, NULL, NULL, 0, 0, r->pool, NULL, NULL)) == NULL) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate long pooling timeout message in shared memory");
         }
     }
@@ -1876,7 +2062,7 @@ ngx_http_push_stream_delete_channel(ngx_http_push_stream_main_conf_t *mcf, ngx_h
 
     if (deleted) {
         // apply channel deleted message text to message template - outside the lock
-        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL)) == NULL) {
+        if ((channel->channel_deleted_message = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, text, len, channel, NGX_HTTP_PUSH_STREAM_CHANNEL_DELETED_MESSAGE_ID, NULL, NULL, 0, 0, temp_pool, NULL, NULL)) == NULL) {
             ngx_log_error(NGX_LOG_ERR, temp_pool->log, 0, "push stream module: unable to allocate memory to channel deleted message");
             /* channel is already unlinked and marked deleted - it will still be
                processed by delete_channels_data()/collect_deleted_channels_data(),
@@ -2479,7 +2665,7 @@ ngx_http_push_stream_get_formatted_message(ngx_http_request_t *r, ngx_http_push_
 
 
 static ngx_str_t *
-ngx_http_push_stream_format_message(ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *message, ngx_str_t *text, ngx_http_push_stream_template_t *template, ngx_pool_t *temp_pool)
+ngx_http_push_stream_format_message(ngx_http_push_stream_channel_t *channel, ngx_http_push_stream_msg_t *message, ngx_str_t *text, ngx_http_push_stream_template_t *template, ngx_pool_t *temp_pool, size_t *text_offset)
 {
     u_char                    *last;
     ngx_str_t                 *txt = NULL;
@@ -2546,6 +2732,9 @@ ngx_http_push_stream_format_message(ngx_http_push_stream_channel_t *channel, ngx
                 last = ngx_cpymem(last, tag, tag_len);
                 break;
             case PUSH_STREAM_TEMPLATE_PART_TYPE_TEXT:
+                if (text_offset != NULL) {
+                    *text_offset = last - txt->data;
+                }
                 last = ngx_cpymem(last, text->data, text->len);
                 break;
             case PUSH_STREAM_TEMPLATE_PART_TYPE_SIZE:

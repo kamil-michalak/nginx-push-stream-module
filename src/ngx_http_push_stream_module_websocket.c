@@ -928,7 +928,7 @@ ngx_http_push_stream_websocket_reading(ngx_http_request_t *r)
                                 /* no Message-TTL override here - WebSocket frames carry no headers to
                                    read one from. A channel's TTL set earlier via an HTTP publish
                                    (Message-TTL header, remembered on the channel) still applies. */
-                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, NULL, cf->store_messages, ctx->temp_pool, shared_raw_content) != NGX_OK) {
+                                if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, subscription->channel, ctx->frame->payload, ctx->frame->payload_len, NULL, NULL, NULL, cf->store_messages, ctx->temp_pool, shared_raw_content, NULL) != NGX_OK) {
                                     /* drop the loop's own transient reference before bailing -
                                        any channel that already attached successfully keeps its own */
                                     ngx_http_push_stream_raw_content_unref(mcf->shpool, shared_raw_content);

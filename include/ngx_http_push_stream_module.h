@@ -216,6 +216,9 @@ typedef struct {
     ngx_uint_t                      stat_max_keys;  /* default per-group cap on distinct dimension keys
                                                        (push_stream_stat_max_keys); overflow folds into
                                                        one "__overflow__" bucket per group */
+    ngx_int_t                       websocket_deflate_level;  /* zlib level (1-9) for the cached
+                                                                 permessage-deflate frames
+                                                                 (push_stream_websocket_deflate_level) */
     ngx_shm_zone_t                 *shm_zone;
     ngx_slab_pool_t                *shpool;
     ngx_http_push_stream_shm_data_t*shm_data;

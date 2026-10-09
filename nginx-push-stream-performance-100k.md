@@ -484,6 +484,52 @@ dostaje `pong`; ramka wpada w ścieżkę publish albo jest ignorowana. Trzeba wy
 `?<payload>`. Drobiazg, ale może generować timeouty po stronie klienta jeśli
 biblioteka kliencka wysyła goły `?`.
 
+### 🟠 15. `deflate()` per kanał pod `channel->mutex` blokuje inne workery  ✅ NAPRAWIONE (branch `test25`)
+
+> **Incydent 2026-10-03 ~16:12–16:39 (sobota, szczyt):** healthcheck Swarma
+> (`curl https://localhost/`, timeout 5 s) zabił `nginx-frontend` kolejno na
+> s3, s1, s2 (`exit 137: unhealthy container`). nginx obsługiwał ~14k req/s,
+> ale losowe workery stały po kilka sekund; emitter dostawał timeouty 10/30 s,
+> a po zabiciu `connection refused` po 0–2 ms. Kolejka accept nie była
+> przepełniona, `reuseport` na 443 działa (32 gniazda, równy rozkład).
+
+**Mechanizm.** Publikacja do N kanałów (emitter: do 100 w jednym POST) woła
+`add_msg_to_channel()` per kanał, a ta formatuje szablon i robi `deflate()`
+całej wiadomości **pod `channel->mutex`**. Szablon zawiera `~id~`, `~tag~`,
+`~time~`, więc ramka różni się per kanał — ten sam patch był kompresowany N razy
+(poziom 6). Mutexów kanałów jest tylko 10 (`channels_mutex[% 10]`), biorą je też
+dostarczanie wiadomości (`ipc.c`) w **każdym** workerze, subskrypcja i
+sprzątanie — więc kompresja w workerze publikującym zatrzymywała pętle zdarzeń
+innych workerów.
+
+**Fix (`test25`).**
+- **Ciało kompresowane raz na publikację, bez locka**
+  (`ngx_http_push_stream_deflate_publish_text()` w `publisher.c` przed pętlą,
+  także dla `Startup-Message`). Per kanał
+  (`ngx_http_push_stream_deflate_websocket_frame_spliced()`) payload to
+  `stored(prefiks) + segment_ciała + stored(sufiks) + 0x00`: segment to
+  niezależny raw-deflate zakończony `Z_SYNC_FLUSH` (wyrównany do bajtu, bez
+  BFINAL, bez odwołań wstecz), prefiks/sufiks szablonu idą jako bloki „stored"
+  (dzielone co 65535 B), końcowe `0x00` to nagłówek pustego bloku, którego
+  `00 00 FF FF` dokleja odbiorca (RFC 7692 §7.2.2). Pod lockiem zostaje
+  `memcpy` + alokacja w shm. Szablony z `~text~` ≠ 1 razy i eventsource —
+  stara ścieżka.
+- **`push_stream_websocket_deflate_level 1..9`** (http, domyślnie 6 = dotychczasowe
+  `Z_DEFAULT_COMPRESSION`).
+- `deflate_segment()` sprawdza `avail_in == 0 && avail_out > 0` (bufor z
+  `deflateBound()+16`) — wcześniej przy za małym buforze mogła wyjść ucięta ramka.
+
+**Pomiar (lokalnie, nginx 1.31.6, 4 workery, POST 409 KiB → 100 kanałów,
+mediana):** test24 **668 ms**, test25 poziom 6 **101 ms**, poziom 1 **78 ms**.
+Poprawność: surowy klient WS (inflate jak przeglądarka, świeży stream na
+wiadomość) == klient bez kompresji dla: małej wiadomości (bez RSV1), 4 KB i
+409 KiB JSON (64-bit długość ramki), base64, prefiksu > 65535 B (długi
+`Event-Id`), `Startup-Message`; poziomy 6 i 1.
+
+**Do rozważenia dalej:** więcej niż 10 mutexów kanałów (np. 64) — mniejsza
+szansa, że różne kanały czekają na siebie; formatowanie szablonu (memcpy N×
+ciało) też dałoby się wynieść poza lock.
+
 ---
 
 ## Zmiany będące plusami przy tej skali (dla równowagi)

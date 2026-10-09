@@ -254,6 +254,7 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     ngx_http_push_stream_loc_conf_t        *cf = ngx_http_get_module_loc_conf(r, ngx_http_push_stream_module);
     ngx_buf_t                              *buf = NULL;
     ngx_http_push_stream_shared_raw_content_t      *shared_raw_content;
+    ngx_str_t                                      *deflated_text;
 
     ngx_http_push_stream_requested_channel_t       *requested_channel;
     ngx_queue_t                                    *q;
@@ -299,6 +300,15 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     event_type = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_EVENT_TYPE);
     message_ttl_header = ngx_http_push_stream_get_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_MESSAGE_TTL);
 
+    /* The body is the same for every target channel - compress it for
+       permessage-deflate websocket subscribers ONCE, here, with no lock held.
+       Each per-channel message below only splices it between its own
+       template parts instead of running deflate() again per channel (inside
+       channel->mutex on the add_msg_to_channel() path, stalling every worker
+       that delivers a channel sharing that mutex). NULL = nothing to splice
+       into, or compression failed - the per-channel path handles it as before. */
+    deflated_text = ngx_http_push_stream_deflate_publish_text(mcf, buf->pos, ngx_buf_size(buf), r->pool);
+
     /* A Startup-Message: 1 publish with a non-empty body stores that body as
        the target channel(s)' startup message: it is NOT appended to the
        message buffer and NOT broadcast to current subscribers - only replayed
@@ -327,7 +337,7 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
 
             startup_msg = ngx_http_push_stream_convert_char_to_msg_on_shared(mcf, buf->pos, ngx_buf_size(buf),
                 requested_channel->channel, NGX_HTTP_PUSH_STREAM_STARTUP_MESSAGE_ID,
-                event_id, event_type, since_time, since_tag, r->pool, NULL);
+                event_id, event_type, since_time, since_tag, r->pool, NULL, deflated_text);
             if (startup_msg == NULL) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push stream module: unable to allocate startup message in shared memory");
                 ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -365,7 +375,7 @@ ngx_http_push_stream_publisher_body_handler(ngx_http_request_t *r)
     for (q = ngx_queue_head(&ctx->requested_channels->queue); q != ngx_queue_sentinel(&ctx->requested_channels->queue); q = ngx_queue_next(q)) {
         requested_channel = ngx_queue_data(q, ngx_http_push_stream_requested_channel_t, queue);
 
-        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, message_ttl_header, cf->store_messages, r->pool, shared_raw_content) != NGX_OK) {
+        if (ngx_http_push_stream_add_msg_to_channel(mcf, r->connection->log, requested_channel->channel, buf->pos, ngx_buf_size(buf), event_id, event_type, message_ttl_header, cf->store_messages, r->pool, shared_raw_content, deflated_text) != NGX_OK) {
             /* drop the loop's own transient reference before bailing - any
                channel that already attached successfully still holds its own,
                so this doesn't free content those channels are relying on */
