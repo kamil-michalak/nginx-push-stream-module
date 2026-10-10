@@ -224,6 +224,10 @@ ngx_http_push_stream_round_to_bucket(size_t size)
     return ((size + 4095) / 4096) * 4096;
 }
 
+/* compile-time check: a chunk (header + payload) must be exactly one slab page */
+typedef char ngx_http_push_stream_chunk_is_one_page[
+    (sizeof(ngx_http_push_stream_chunk_t) == NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE) ? 1 : -1];
+
 /*
  * Allocates content in shared memory, choosing representation based on size:
  *   - small (< NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD): single bucketed

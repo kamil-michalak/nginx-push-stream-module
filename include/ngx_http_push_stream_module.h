@@ -142,16 +142,25 @@ typedef struct ngx_http_push_stream_shared_raw_content_s ngx_http_push_stream_sh
  * because no run of 196 CONTIGUOUS free pages exists, even though the total
  * free space is far more than enough (ngx_slab_alloc() failed: no memory).
  *
- * Each chunk is exactly one page (NGX_HTTP_PUSH_STREAM_CHUNK_SIZE), so it
- * only ever needs a SINGLE free page to satisfy - the most commonly
- * available unit of free space, regardless of fragmentation elsewhere.
- * Only large content uses this representation; see
- * NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD - smaller content keeps using a
- * single ngx_str_t allocation (via ngx_http_push_stream_round_to_bucket) for
- * simplicity and to avoid linked-list overhead for the common case.
+ * Each chunk - header included - is exactly one page
+ * (NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE), so it only ever needs a SINGLE
+ * free page to satisfy - the most commonly available unit of free space,
+ * regardless of fragmentation elsewhere. The payload capacity
+ * (NGX_HTTP_PUSH_STREAM_CHUNK_SIZE) is the page minus the next/len header:
+ * a 4096-byte payload made the struct 4112 bytes, which ngx_slab_alloc()
+ * rounds up to TWO contiguous pages - doubling the footprint and making
+ * every chunk allocation walk the free list (under the global shpool->mutex)
+ * past all single-page gaps. A one-page request is served by the first free
+ * run on the list, so its cost does not grow with fragmentation.
+ *
+ * Content below NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD keeps using a single
+ * ngx_str_t allocation (via ngx_http_push_stream_round_to_bucket). The
+ * threshold is one page so that allocation is also never multi-page (the
+ * 8192/16384 buckets had the same free-list walk).
  */
-#define NGX_HTTP_PUSH_STREAM_CHUNK_SIZE       4096
-#define NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD  16384
+#define NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE 4096
+#define NGX_HTTP_PUSH_STREAM_CHUNK_SIZE       (NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE - sizeof(void *) - sizeof(size_t))
+#define NGX_HTTP_PUSH_STREAM_CHUNK_THRESHOLD  NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE
 
 typedef struct ngx_http_push_stream_chunk_s ngx_http_push_stream_chunk_t;
 struct ngx_http_push_stream_chunk_s {

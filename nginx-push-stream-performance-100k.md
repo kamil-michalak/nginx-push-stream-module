@@ -769,6 +769,77 @@ kopiować id pod lockiem albo użyć snapshotu z punktu 16.
    reloadzie), 8 (`r->pool` rośnie z komendami WS), 12 (wysyłka > 16 KB
    w kawałkach per subskrybent).
 
+## Sobota 2026-10-10 — przycięcia na s1 i chunk = 2 strony (`test28`)
+
+### Obserwacja na produkcji (obraz z `test25`)
+
+- s1 w szczycie (~2,5k req/s web na węzeł, ~50–60k ESTAB): pojedyncze
+  healthchecki `/healthz` ~9 s (`curl --max-time 9`, exit 1) o 16:18, 17:19,
+  17:31; sonda co ~3 s złapała 17:33 (6,0 s) i 17:43 (3,7 s). `FailingStreak`
+  wraca do 0 — Swarm nie zabija (5 retry). s2/s3 bez przycięć.
+- Zrzut w trakcie przycięcia (`/proc/<pid>/syscall`, `stack`): **26 z 32
+  workerów w `futex`** (`sem_wait` w `ngx_shmtx_lock`), 5 w user space, żaden
+  nie mieli CPU (max 35%). W pierwszym zrzucie adres futexa
+  `0x7f69de04f080` = początek strefy push-stream (24 GiB) **+0x80** =
+  `ngx_slab_pool_t.mutex.sem`, czyli **`shpool->mutex`** (globalny lock
+  alokatora). Histogram adresów futexów (który lock trzyma większość) —
+  do potwierdzenia przy kolejnym przycięciu (sonda v3).
+- `/system-tools/push/stats` s1: `channels 5166`, `stored_messages 938k`,
+  `messages_in_trash 22k`, `shm_free_runs 4096` (= cap walka),
+  `shm_free_mb 232`, `shm_largest_free_run_kb 7428` (oba zaniżone przez cap;
+  RSS kontenera ~5 GB, więc reszta 24 GiB to dziewiczy ogon dalej na liście).
+
+### 25. Chunk zajmował 2 strony zamiast 1  ✅ NAPRAWIONE (branch `test28`)
+
+`ngx_http_push_stream_chunk_t` = `next` (8) + `len` (8) + `data[4096]` =
+**4112 B** → `ngx_slab_alloc()` > `pagesize` → `ngx_slab_alloc_pages(pool, 2)`.
+Każdy „jednostronicowy” chunk brał **2 sąsiednie strony** — wbrew założeniu
+z komentarza (cała idea chunkowania to „wystarczy jedna wolna strona”):
+
+- 2× footprint dużych wiadomości (100 KiB: 190 → 97 stron/wiadomość, 400 ×
+  100 KiB: 297 → 152 MiB), więcej fragmentacji i wcześniej `no memory`,
+- chunk musi szukać runu ≥ 2 stron, więc `ngx_slab_alloc_pages` (first-fit od
+  głowy listy, pod `shpool->mutex`) przechodzi obok jednostronicowych dziur.
+
+Poprawka: `NGX_HTTP_PUSH_STREAM_CHUNK_ALLOC_SIZE 4096`,
+`CHUNK_SIZE = 4096 - sizeof(void *) - sizeof(size_t)` (4080 B payloadu),
+compile-time assert `sizeof(chunk) == 4096`, oraz
+`CHUNK_THRESHOLD 16384 → 4096` — kubełki 8192/16384 (2/4 strony) dla
+treści 4–16 KiB też szukały runów wielostronicowych; teraz żadna alokacja
+treści wiadomości nie przekracza jednej strony. Koszt: treści 4–16 KiB idą
+jako 1–4 chunki (więcej `ngx_buf` przy wysyłce, punkt 12).
+
+Testy lokalne (nginx 1.31.6, `-Wall -Werror`, `test26` vs `test28`):
+
+- poprawność — długości 1, 2048, 2049, 4079–4081, 4095–4097, 8192,
+  16383–16385, 250000 przez long-polling bajt w bajt na obu,
+- footprint — jak wyżej, dokładnie 2×,
+- fragmentacja (30k kanałów × 1 strona, co drugi usunięty → 15k dziur
+  jednostronicowych, strażnik za nimi): publish 240 KiB → 100 kanałów
+  31–32 ms → 20–23 ms,
+- rywalizacja (8 workerów, 6 publisherów 240 KiB → 100 kanałów + mała
+  publikacja co 5 ms): bez różnicy ponad szum (p50 ~1 ms, p99 ~3 ms,
+  p999 20–39 ms na wszystkich wariantach); `no memory` 4955 → 4129 przy tym
+  samym obciążeniu.
+
+**Uczciwie:** lokalnie nie udało się odtworzyć wielosekundowych przycięć —
+ani długiego walka (scalenie z dziewiczym ogonem przenosi duży run na głowę
+listy, a na prod pierwsze 4096 runów to średnio ~14,5 strony), ani
+konwoju. Poprawka jest pewna co do pamięci; wpływ na przycięcia —
+do zmierzenia na produkcji.
+
+**Sprawdzone i odrzucone:** alokacja całego łańcucha chunków pod jednym
+`shpool->mutex` (`ngx_slab_alloc_locked`, kopiowanie po puszczeniu) —
+1 przejęcie zamiast ~60 na 240 KiB. Przy pełnym obciążeniu ogon małych
+publikacji **gorszy** (p99 67 ms, p999 110–211 ms, max 258 ms vs ~20 ms):
+dłuższe trzymanie globalnego locka blokuje wszystkich. Nie wchodzi.
+
+**Dalej:** wdrożyć `test28` (= `test26` + punkt 25) poza szczytem; sonda
+na s1 (histogram adresów futexów + mapowanie na strefę) przy kolejnym
+przycięciu powie, czy to `shpool->mutex`, czy mutex kanału / globalny lock
+z punktów 16–18 (te naprawia już `test26`). Instrumentacja locków (pkt 3
+planu) nadal najlepsza droga do pewności.
+
 ---
 
 ## Zmiany będące plusami przy tej skali (dla równowagi)
