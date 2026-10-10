@@ -42,9 +42,15 @@ static ngx_inline void ngx_http_push_stream_cleanup_shutting_down_worker_data(ng
 ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r, ngx_chain_t *in);
 
 /*
- * Cached, per-worker snapshot of the slab zone's free-space / fragmentation
- * state, refreshed at most once per NGX_HTTP_PUSH_STREAM_SHM_GAUGE_TTL
- * seconds.
+ * Slab zone free-space / fragmentation gauge.
+ *
+ * free_pages is exact: nginx keeps the number of free pages in
+ * shpool->pfree, updated by every page alloc/free. It is read on every call,
+ * lock-free (one aligned machine word; at worst a moment stale).
+ *
+ * free_runs / largest_run need a walk of the free list and are a cached,
+ * per-worker snapshot, refreshed at most once per
+ * NGX_HTTP_PUSH_STREAM_SHM_GAUGE_TTL seconds.
  *
  * Walking shpool->free requires shpool->mutex - the SAME global lock every
  * ngx_slab_alloc()/ngx_slab_free() across every worker contends on for
@@ -61,8 +67,10 @@ ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r
  * The walk itself is capped at NGX_HTTP_PUSH_STREAM_SHM_GAUGE_WALK_CAP free
  * runs regardless of TTL, so even a genuinely (not corrupted) very
  * fragmented multi-GB zone bounds the worst-case lock hold; `capped` marks
- * free_pages/free_runs/largest_run as a lower bound, not exact, when that
- * happens.
+ * free_runs/largest_run as a lower bound, not exact, when that happens.
+ * (free_pages used to be summed in the same walk, so under fragmentation it
+ * covered only the first WALK_CAP runs and read as "almost no free memory"
+ * while gigabytes were free further down the list.)
  */
 #define NGX_HTTP_PUSH_STREAM_SHM_GAUGE_TTL       3      /* seconds before a refresh re-takes the lock */
 #define NGX_HTTP_PUSH_STREAM_SHM_GAUGE_WALK_CAP  4096   /* max free-list entries walked per refresh */
@@ -70,10 +78,7 @@ ngx_int_t               ngx_http_push_stream_output_filter(ngx_http_request_t *r
 typedef struct {
     time_t      computed;       /* ngx_time() of last refresh; 0 = never computed yet */
     size_t      total_size;     /* bytes - computed once, then reused forever */
-    ngx_uint_t  free_pages;     /* sum of page->slab across the free list - REAL free page count
-                                    (the old version counted free-list ENTRIES, i.e. free RUNS, and
-                                    mislabeled that as pages - shm_free_mb was wrong by up to 1-2
-                                    orders of magnitude under fragmentation) */
+    ngx_uint_t  free_pages;     /* exact free page count (shpool->pfree), refreshed on every call */
     ngx_uint_t  free_runs;      /* number of free-list entries - a fragmentation indicator on its own */
     ngx_uint_t  largest_run;    /* pages in the single biggest free run - the number that actually
                                     predicts whether the next large allocation (e.g. a chunk chain)
@@ -88,7 +93,9 @@ static ngx_http_push_stream_shm_gauge_t *
 ngx_http_push_stream_get_shm_gauge(ngx_slab_pool_t *shpool)
 {
     ngx_slab_page_t *page;
-    ngx_uint_t       runs, pages, largest;
+    ngx_uint_t       runs, largest;
+
+    ngx_http_push_stream_shm_gauge.free_pages = shpool->pfree;
 
     if ((ngx_http_push_stream_shm_gauge.computed != 0)
         && ((ngx_time() - ngx_http_push_stream_shm_gauge.computed) < NGX_HTTP_PUSH_STREAM_SHM_GAUGE_TTL)) {
@@ -101,13 +108,11 @@ ngx_http_push_stream_get_shm_gauge(ngx_slab_pool_t *shpool)
     }
 
     runs = 0;
-    pages = 0;
     largest = 0;
 
     ngx_shmtx_lock(&shpool->mutex);
     for (page = shpool->free.next; page != &shpool->free; page = page->next) {
         runs++;
-        pages += page->slab;
         if (page->slab > largest) {
             largest = page->slab;
         }
@@ -118,7 +123,6 @@ ngx_http_push_stream_get_shm_gauge(ngx_slab_pool_t *shpool)
     ngx_shmtx_unlock(&shpool->mutex);
 
     ngx_http_push_stream_shm_gauge.free_runs   = runs;
-    ngx_http_push_stream_shm_gauge.free_pages  = pages;
     ngx_http_push_stream_shm_gauge.largest_run = largest;
     ngx_http_push_stream_shm_gauge.capped      = (runs >= NGX_HTTP_PUSH_STREAM_SHM_GAUGE_WALK_CAP);
     ngx_http_push_stream_shm_gauge.computed    = ngx_time();
@@ -164,11 +168,11 @@ ngx_http_push_stream_log_slab_alloc_failure(ngx_slab_pool_t *shpool, size_t requ
 
     ngx_log_error(NGX_LOG_CRIT, ngx_cycle->log, 0,
         "push stream module: slab alloc failed at [%s], requested %uz bytes; "
-        "zone total=%uzM, free_pages~=%ui%s (%uzM), free_runs~=%ui%s, largest_free_run~=%ui%s pages (%uzK) "
+        "zone total=%uzM, free_pages=%ui (%uzM), free_runs~=%ui%s, largest_free_run~=%ui%s pages (%uzK) "
         "(%ui more failures suppressed in the last %ds)",
         where, requested_size,
         g->total_size / (1024 * 1024),
-        g->free_pages, g->capped ? "+" : "", (g->free_pages * (size_t) ngx_pagesize) / (1024 * 1024),
+        g->free_pages, (g->free_pages * (size_t) ngx_pagesize) / (1024 * 1024),
         g->free_runs, g->capped ? "+" : "",
         g->largest_run, g->capped ? "+" : "", (g->largest_run * (size_t) ngx_pagesize) / 1024,
         ngx_http_push_stream_suppressed_alloc_failures, NGX_HTTP_PUSH_STREAM_ALLOC_FAILURE_LOG_INTERVAL);

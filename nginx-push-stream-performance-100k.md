@@ -834,7 +834,33 @@ do zmierzenia na produkcji.
 publikacji **gorszy** (p99 67 ms, p999 110–211 ms, max 258 ms vs ~20 ms):
 dłuższe trzymanie globalnego locka blokuje wszystkich. Nie wchodzi.
 
-**Dalej:** wdrożyć `test28` (= `test26` + punkt 25) poza szczytem; sonda
+### 26. `shm_free_mb` liczone tylko z pierwszych 4096 runów  ✅ NAPRAWIONE (branch `test28`)
+
+`shm_free_pages`/`shm_free_mb` były sumą stron z walka po liście wolnych
+runów, uciętego na `WALK_CAP` = 4096. Przy fragmentacji (prod zawsze ma ≥ 4096
+runów) metryka mówiła tylko o głowie listy i skakała w zależności od tego, czy
+duży dziewiczy run akurat był wśród pierwszych 4096 (scalenie przy zwolnieniu
+wstawia run na głowę): s1 o 17:44 `shm_free_mb 232` / `largest 7428 KB`,
+chwilę później inny zrzut `3051` / `2264496 KB`, przy praktycznie tej samej
+zajętości. Alarm Netdata `push_shm_low` (`crit < 256 MiB`) liczony z tej
+metryki mógł strzelać fałszywie.
+
+Poprawka: `shm_free_pages` = `shpool->pfree` (nginx utrzymuje dokładny licznik
+wolnych stron przy każdej alokacji/zwolnieniu stron) — dokładne, czytane przy
+każdym zapytaniu, bez locka i bez walka. `shm_free_runs` i
+`shm_largest_free_run_kb` dalej z walka (TTL 3 s, cap 4096) + nowe pole
+**`shm_free_runs_capped`** (0/1) we wszystkich formatach (PLAIN/JSON/YAML/XML):
+1 = te dwa pola to dolna granica. Log `slab alloc failed` pokazuje dokładne
+`free_pages` (bez `~`/`+`).
+
+Uwaga: `pfree` liczy wolne **strony**; wolne sloty w częściowo zajętych
+stronach małych alokacji (≤ 2 KB) nie wchodzą — to bliżej „ile jeszcze dużych
+alokacji się zmieści”, czyli tego, co alarm ma mierzyć.
+
+Test lokalny (2 GiB, 15k jednostronicowych dziur): stara metryka 1917 MB,
+nowa 1959 MB (różnica = dziury za capem); wszystkie 4 formaty parsowalne.
+
+**Dalej:** wdrożyć `test28` (= `test26` + punkty 25–26) poza szczytem; sonda
 na s1 (histogram adresów futexów + mapowanie na strefę) przy kolejnym
 przycięciu powie, czy to `shpool->mutex`, czy mutex kanału / globalny lock
 z punktów 16–18 (te naprawia już `test26`). Instrumentacja locków (pkt 3
