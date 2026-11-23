@@ -43,6 +43,11 @@ static void ngx_http_push_stream_ipc_resume_handler(ngx_event_t *ev);
    iteration, see ngx_http_push_stream_process_worker_message */
 #define NGX_HTTP_PUSH_STREAM_IPC_MESSAGES_PER_CALL  32
 
+/* an inbox whose oldest message waited this long missed its wake-up */
+#define NGX_HTTP_PUSH_STREAM_IPC_STALL_SEC          2
+/* at most one lost-alert / recovered-inbox WARN per process per interval */
+#define NGX_HTTP_PUSH_STREAM_IPC_LOG_INTERVAL       10
+
 static ngx_event_t  ngx_http_push_stream_ipc_resume_event;
 
 /*
@@ -248,15 +253,19 @@ static ngx_int_t
 ngx_http_push_stream_unsubscribe_worker(ngx_http_push_stream_channel_t *channel, ngx_slab_pool_t *shpool)
 {
     ngx_http_push_stream_pid_queue_t        *worker;
-    ngx_queue_t                             *q;
+    ngx_queue_t                             *q, *next;
 
+    /* remove EVERY entry of this process or this slot: a channel can hold
+       both a stale entry of a dead worker that had this slot and this
+       worker's own - stopping at the first left the other one collecting
+       messages into an inbox nobody drains */
     ngx_shmtx_lock(channel->mutex);
-    for (q = ngx_queue_head(&channel->workers_with_subscribers); q != ngx_queue_sentinel(&channel->workers_with_subscribers); q = ngx_queue_next(q)) {
+    for (q = ngx_queue_head(&channel->workers_with_subscribers); q != ngx_queue_sentinel(&channel->workers_with_subscribers); q = next) {
+        next = ngx_queue_next(q);
         worker = ngx_queue_data(q, ngx_http_push_stream_pid_queue_t, queue);
         if ((worker->pid == ngx_pid) || (worker->slot == ngx_process_slot)) {
             ngx_queue_remove(&worker->queue);
             ngx_slab_free(shpool, worker);
-            break;
         }
     }
     ngx_shmtx_unlock(channel->mutex);
@@ -266,19 +275,41 @@ ngx_http_push_stream_unsubscribe_worker(ngx_http_push_stream_channel_t *channel,
 
 
 static void
-ngx_http_push_stream_clean_worker_data(ngx_http_push_stream_shm_data_t *data)
+ngx_http_push_stream_drain_worker_inbox(ngx_http_push_stream_shm_data_t *data)
 {
-    ngx_slab_pool_t                        *shpool = data->shpool;
-    ngx_queue_t                            *cur, *q;
-    ngx_http_push_stream_channel_t         *channel;
+    ngx_queue_t                            *cur;
     ngx_http_push_stream_worker_msg_t      *worker_msg;
 
-    /* drain pending IPC messages for this slot */
     while (!ngx_queue_empty(&data->ipc[ngx_process_slot].messages_queue)) {
         cur = ngx_queue_head(&data->ipc[ngx_process_slot].messages_queue);
         worker_msg = ngx_queue_data(cur, ngx_http_push_stream_worker_msg_t, queue);
-        ngx_http_push_stream_free_worker_message_memory(shpool, worker_msg);
+        ngx_http_push_stream_free_worker_message_memory(data->shpool, worker_msg);
     }
+}
+
+
+static void
+ngx_http_push_stream_clean_worker_data(ngx_http_push_stream_shm_data_t *data)
+{
+    ngx_slab_pool_t                        *shpool = data->shpool;
+    ngx_queue_t                            *q;
+    ngx_http_push_stream_channel_t         *channel;
+
+    /* Unsubscribe from every channel FIRST, drain the inbox AFTER: the walk
+       takes each channel->mutex (milliseconds over thousands of channels),
+       and producers keep queueing into this slot until our entry is gone
+       from a channel. Draining first left those messages - each holding a
+       reference - in the inbox of a slot nobody may ever use again. */
+    ngx_shmtx_lock(&data->channels_queue_mutex);
+    for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
+        channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
+        ngx_http_push_stream_unsubscribe_worker(channel, shpool);
+    }
+    ngx_shmtx_unlock(&data->channels_queue_mutex);
+
+    /* no channel lists this slot any more, so nothing new can arrive */
+    ngx_http_push_stream_drain_worker_inbox(data);
+    data->ipc[ngx_process_slot].alert_lost = 0;
 
     /* only reset the subscribers queue if no other process is using this slot.
        On reload a new worker can start on the same slot while the old one is
@@ -289,13 +320,6 @@ ngx_http_push_stream_clean_worker_data(ngx_http_push_stream_shm_data_t *data)
         || data->ipc[ngx_process_slot].pid == ngx_pid) {
         ngx_queue_init(&data->ipc[ngx_process_slot].subscribers_queue);
     }
-
-    ngx_shmtx_lock(&data->channels_queue_mutex);
-    for (q = ngx_queue_head(&data->channels_queue); q != ngx_queue_sentinel(&data->channels_queue); q = ngx_queue_next(q)) {
-        channel = ngx_queue_data(q, ngx_http_push_stream_channel_t, queue);
-        ngx_http_push_stream_unsubscribe_worker(channel, shpool);
-    }
-    ngx_shmtx_unlock(&data->channels_queue_mutex);
 
     data->ipc[ngx_process_slot].pid = NGX_INVALID_FILE;
     data->ipc[ngx_process_slot].subscribers = 0;
@@ -520,6 +544,9 @@ ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t
     ngx_http_push_stream_worker_data_t     *thisworker_data = data->ipc + ngx_process_slot;
     ngx_uint_t                              processed = 0;
 
+    /* this worker is awake: any alert lost before now is moot (see
+       ngx_http_push_stream_worker_data_t) */
+    thisworker_data->alert_lost = 0;
 
     while (!ngx_queue_empty(&thisworker_data->messages_queue)) {
         if (processed++ >= NGX_HTTP_PUSH_STREAM_IPC_MESSAGES_PER_CALL) {
@@ -558,6 +585,74 @@ ngx_http_push_stream_process_worker_message_data(ngx_http_push_stream_shm_data_t
 }
 
 
+/* one WARN per NGX_HTTP_PUSH_STREAM_IPC_LOG_INTERVAL per process, with the
+   count of the ones folded into it - an old worker after reload fails for
+   every new slot on every publish */
+static void
+ngx_http_push_stream_log_lost_alert(ngx_pid_t pid, ngx_int_t slot, ngx_log_t *log)
+{
+    static time_t      last_log = 0;
+    static ngx_uint_t  suppressed = 0;
+
+    if (ngx_time() - last_log < NGX_HTTP_PUSH_STREAM_IPC_LOG_INTERVAL) {
+        suppressed++;
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, log, 0, "push stream module: could not wake worker pid: %P, slot: %i (%s); flagged alert_lost, %ui more in the last %ds", pid, slot,
+                  (ngx_http_push_stream_socketpairs[slot][0] == NGX_INVALID_FILE) ? "no socketpair to that slot in this process" : "write failed",
+                  suppressed, NGX_HTTP_PUSH_STREAM_IPC_LOG_INTERVAL);
+    last_log = ngx_time();
+    suppressed = 0;
+}
+
+
+/*
+ * Backstop for a lost wake-up (see ngx_http_push_stream_worker_data_t): run
+ * from the memory cleanup timer. An inbox whose oldest message has waited
+ * NGX_HTTP_PUSH_STREAM_IPC_STALL_SEC is drained here, so a lost alert costs
+ * seconds instead of the worker's whole life. Draining is idempotent; the
+ * head read without the lock is the same one process_worker_message_data()
+ * does (only the owner removes, producers append at the tail).
+ */
+static void
+ngx_http_push_stream_recover_worker_inbox(void)
+{
+    ngx_http_push_stream_global_shm_data_t *global_data = (ngx_http_push_stream_global_shm_data_t *) ngx_http_push_stream_global_shm_zone->data;
+    ngx_http_push_stream_worker_data_t     *thisworker_data;
+    ngx_http_push_stream_worker_msg_t      *oldest;
+    ngx_queue_t                            *q;
+    ngx_flag_t                              stalled = 0;
+    static time_t                           last_log = 0;
+
+    for (q = ngx_queue_head(&global_data->shm_datas_queue); q != ngx_queue_sentinel(&global_data->shm_datas_queue); q = ngx_queue_next(q)) {
+        ngx_http_push_stream_shm_data_t *data = ngx_queue_data(q, ngx_http_push_stream_shm_data_t, shm_data_queue);
+        thisworker_data = data->ipc + ngx_process_slot;
+
+        if ((thisworker_data->pid != ngx_pid) || ngx_queue_empty(&thisworker_data->messages_queue)) {
+            continue;
+        }
+
+        oldest = ngx_queue_data(ngx_queue_head(&thisworker_data->messages_queue), ngx_http_push_stream_worker_msg_t, queue);
+        if ((uint32_t) ngx_time() - oldest->queued < NGX_HTTP_PUSH_STREAM_IPC_STALL_SEC) {
+            continue;
+        }
+
+        stalled = 1;
+        thisworker_data->inbox_recovered++;
+        if (ngx_time() - last_log >= NGX_HTTP_PUSH_STREAM_IPC_LOG_INTERVAL) {
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0, "push stream module: IPC inbox of worker %P waited %uD s with %ui messages queued - a wake-up was lost, draining it from the cleanup timer",
+                          ngx_pid, (uint32_t) ngx_time() - oldest->queued, thisworker_data->inbox);
+            last_log = ngx_time();
+        }
+    }
+
+    if (stalled) {
+        ngx_http_push_stream_process_worker_message();
+    }
+}
+
+
 static ngx_int_t
 ngx_http_push_stream_send_worker_message(ngx_http_push_stream_channel_t *channel, ngx_queue_t *subscriptions_sentinel, ngx_pid_t pid, ngx_int_t worker_slot, ngx_http_push_stream_msg_t *msg, ngx_flag_t *queue_was_empty, ngx_log_t *log, ngx_http_push_stream_main_conf_t *mcf)
 {
@@ -578,8 +673,13 @@ ngx_http_push_stream_send_worker_message(ngx_http_push_stream_channel_t *channel
     newmessage->subscriptions_sentinel = subscriptions_sentinel;
     newmessage->channel = channel;
     newmessage->mcf = mcf;
-    *queue_was_empty = ngx_queue_empty(&thisworker_data->messages_queue);
+    newmessage->inbox = &thisworker_data->inbox;
+    newmessage->queued = (uint32_t) ngx_time();
+    /* alert_lost: an earlier producer could not wake this worker, so the
+       inbox being non-empty no longer means "an alert is on its way" */
+    *queue_was_empty = ngx_queue_empty(&thisworker_data->messages_queue) || thisworker_data->alert_lost;
     ngx_queue_insert_tail(&thisworker_data->messages_queue, &newmessage->queue);
+    thisworker_data->inbox++;   /* under shpool->mutex, like the decrement */
     ngx_shmtx_unlock(&shpool->mutex);
 
     return NGX_OK;
@@ -615,8 +715,17 @@ ngx_http_push_stream_broadcast(ngx_http_push_stream_channel_t *channel, ngx_http
     /* send IPC alerts outside the lock */
     ngx_int_t i;
     for (i = 0; i < alert_count; i++) {
-        if (ngx_http_push_stream_alert_worker_check_messages(to_alert[i].pid, to_alert[i].slot, log) != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, log, 0, "push stream module: error communicating with worker process, pid: %P, slot: %d", to_alert[i].pid, to_alert[i].slot);
+        /* NGX_INVALID_FILE here means this process has no socketpair to that
+           slot - an old-generation worker after nginx -s reload (pairs for
+           the new slots are created in the master after it was forked).
+           alert_worker() then returns NGX_OK without sending anything, which
+           used to leave the target deaf for good. Mark the slot so the next
+           producer alerts anyway; the owner's cleanup timer is the backstop
+           (ngx_http_push_stream_recover_worker_inbox). */
+        if ((ngx_http_push_stream_socketpairs[to_alert[i].slot][0] == NGX_INVALID_FILE)
+            || (ngx_http_push_stream_alert_worker_check_messages(to_alert[i].pid, to_alert[i].slot, log) != NGX_OK)) {
+            mcf->shm_data->ipc[to_alert[i].slot].alert_lost = 1;
+            ngx_http_push_stream_log_lost_alert(to_alert[i].pid, to_alert[i].slot, log);
         }
     }
 

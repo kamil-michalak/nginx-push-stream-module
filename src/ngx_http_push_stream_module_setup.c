@@ -1312,6 +1312,9 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         d->ipc[i].pid = -1;
         d->ipc[i].startup = 0;
         d->ipc[i].subscribers = 0;
+        d->ipc[i].inbox = 0;
+        d->ipc[i].inbox_recovered = 0;
+        d->ipc[i].alert_lost = 0;
         ngx_queue_init(&d->ipc[i].messages_queue);
         ngx_queue_init(&d->ipc[i].subscribers_queue);
     }

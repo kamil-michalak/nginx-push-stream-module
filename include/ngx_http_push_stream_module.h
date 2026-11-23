@@ -563,17 +563,41 @@ typedef struct {
     ngx_queue_t                         queue;
     ngx_http_push_stream_msg_t         *msg; // ->shared memory
     ngx_pid_t                           pid;
+    uint32_t                            queued; // ngx_time() when queued (stalled inbox detection); fills pid's padding
     ngx_http_push_stream_channel_t     *channel; // ->shared memory
     ngx_queue_t                        *subscriptions_sentinel; // ->a worker's local pool
     ngx_http_push_stream_main_conf_t   *mcf;
+    ngx_uint_t                         *inbox; // ->shared memory: ipc[slot].inbox of the inbox it is queued in
 } ngx_http_push_stream_worker_msg_t;
+/* one worker_msg per subscribed worker per publish: keep it in the 64-byte
+   slab class (a 72-byte struct takes a 128-byte slot) */
+typedef char ngx_http_push_stream_worker_msg_size_check[(sizeof(ngx_http_push_stream_worker_msg_t) <= 64) ? 1 : -1];
 
+/*
+ * A producer only sends CHECK_MESSAGES when the target inbox goes from empty
+ * to non-empty, so one lost alert used to leave the inbox non-empty forever
+ * and the worker deaf for good (s1/s2 2026-11-22: after nginx -s reload, old
+ * workers have no socketpair for the new slots and alert_worker() silently
+ * did nothing). Three guards, see ngx_http_push_stream_broadcast() and
+ * ngx_http_push_stream_recover_worker_inbox():
+ *   alert_lost      - set by a producer whose alert could not be delivered;
+ *                     the next producer alerts even into a non-empty inbox;
+ *                     cleared by the owner when it drains.
+ *   worker_msg->queued - the 4 s cleanup timer drains an inbox whose oldest
+ *                     message waited NGX_HTTP_PUSH_STREAM_IPC_STALL_SEC.
+ *   inbox           - worker messages queued and not yet freed (stats).
+ *   inbox_recovered - times the timer had to drain a stalled inbox (stats;
+ *                     > 0 means a wake-up was lost).
+ */
 typedef struct {
     ngx_queue_t                         messages_queue;
     ngx_queue_t                         subscribers_queue;
     ngx_uint_t                          subscribers; // # of subscribers in the worker
     time_t                              startup;
     pid_t                               pid;
+    ngx_uint_t                          inbox;           // changed only under shpool->mutex
+    ngx_uint_t                          inbox_recovered; // changed only by the owner
+    ngx_flag_t                          alert_lost;
 } ngx_http_push_stream_worker_data_t;
 
 // shared memory

@@ -304,6 +304,11 @@ ngx_http_push_stream_websocket_handler(ngx_http_request_t *r)
     // WebSocket connections must not use keepalive
     r->keepalive = 0;
 
+    /* reload in progress, see ngx_http_push_stream_worker_draining */
+    if (ngx_http_push_stream_worker_draining) {
+        return ngx_http_push_stream_send_only_header_response(r, NGX_HTTP_SERVICE_UNAVAILABLE, NULL);
+    }
+
     // only accept GET method
     if (!(r->method & NGX_HTTP_GET)) {
         ngx_http_push_stream_add_response_header(r, &NGX_HTTP_PUSH_STREAM_HEADER_ALLOW, &NGX_HTTP_PUSH_STREAM_ALLOW_GET);

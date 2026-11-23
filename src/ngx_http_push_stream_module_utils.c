@@ -549,7 +549,15 @@ ngx_http_push_stream_ensure_qtd_of_messages(ngx_http_push_stream_shm_data_t *dat
         q = ngx_queue_head(&channel->message_queue);
         msg = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
 
-        if (expired && (msg->deleted || (msg->expires == 0) || (msg->expires > ngx_time()) || (NGX_HTTP_PUSH_STREAM_MSG_REFS(msg) > 0))) {
+        /* No "still referenced" condition here: it stopped expiry of the
+           whole channel buffer behind one referenced head message (a stalled
+           inbox, a slow send), so up to 512 messages per channel stayed
+           stored (s1 2026-11-23: 740k). Thrown away it only moves to the
+           trash, and the trash frees nothing while REFS > 0 - every user
+           holds the msg pointer itself (collected arrays, worker_msg->msg),
+           nobody walks msg->queue after the lock. Count eviction above
+           already worked this way. */
+        if (expired && (msg->deleted || (msg->expires == 0) || (msg->expires > ngx_time()))) {
             break;
         }
 
@@ -762,7 +770,11 @@ ngx_http_push_stream_delete_channels_data(ngx_http_push_stream_shm_data_t *data)
                     ngx_http_push_stream_send_response_content_header(subscriber->request, ngx_http_get_module_loc_conf(subscriber->request, ngx_http_push_stream_module));
                 }
 
-                ngx_http_push_stream_send_response_message(subscriber->request, channel, channel->channel_deleted_message, 1, 0);
+                /* NULL when delete_channel() could not allocate it (zone
+                   full) - send_response_message() dereferences msg */
+                if (channel->channel_deleted_message != NULL) {
+                    ngx_http_push_stream_send_response_message(subscriber->request, channel, channel->channel_deleted_message, 1, 0);
+                }
 
 
                 // subscriber does not have any other subscription, the connection may be closed
@@ -830,11 +842,27 @@ ngx_http_push_stream_delete_worker_channel(void)
 }
 
 
+/*
+ * Set once this worker got CLEANUP_SHUTTING_DOWN (nginx -s reload: sent by
+ * the master before it forks the new generation) or is exiting. Until SIGQUIT
+ * closes its listeners such a worker still accepts connections, but it is
+ * already unsubscribed from every channel and the new workers cannot alert it
+ * (no socketpair to its slot): a subscriber it took would get the snapshot
+ * and replay, then nothing until worker_shutdown_timeout, while its queued
+ * messages pin shared memory. Subscriber / WebSocket handlers refuse with 503
+ * (the client reconnects to a new worker); the publisher drops keep-alive so
+ * the next publish lands on a new worker, whose alerts arrive.
+ */
+static ngx_flag_t  ngx_http_push_stream_worker_draining = 0;
+
+
 static ngx_inline void
 ngx_http_push_stream_cleanup_shutting_down_worker(void)
 {
     ngx_http_push_stream_global_shm_data_t *global_data = (ngx_http_push_stream_global_shm_data_t *) ngx_http_push_stream_global_shm_zone->data;
     ngx_queue_t                            *q;
+
+    ngx_http_push_stream_worker_draining = 1;
 
     for (q = ngx_queue_head(&global_data->shm_datas_queue); q != ngx_queue_sentinel(&global_data->shm_datas_queue); q = ngx_queue_next(q)) {
         ngx_http_push_stream_shm_data_t *data = ngx_queue_data(q, ngx_http_push_stream_shm_data_t, shm_data_queue);
@@ -2467,6 +2495,9 @@ ngx_http_push_stream_memory_cleanup(void)
         }
     }
 
+    /* a lost IPC wake-up costs seconds, not the worker's life */
+    ngx_http_push_stream_recover_worker_inbox();
+
     return NGX_OK;
 }
 
@@ -2634,6 +2665,9 @@ static void
 ngx_http_push_stream_free_worker_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_stream_worker_msg_t *worker_msg)
 {
     ngx_shmtx_lock(&shpool->mutex);
+    /* not worker_msg->mcf: that is the producer's process memory, and after
+       a reload the consumer can be of another generation */
+    (*worker_msg->inbox)--;   /* under shpool->mutex, like the increment */
     if ((NGX_HTTP_PUSH_STREAM_MSG_UNREF(worker_msg->msg) <= 0) && worker_msg->msg->deleted) {
         worker_msg->msg->expires = ngx_time() + NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL;
     }

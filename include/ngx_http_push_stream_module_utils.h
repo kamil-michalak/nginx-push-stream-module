@@ -50,7 +50,7 @@ typedef struct {
 
 
 #define  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN "channel: %s" CRLF"published_messages: %ui" CRLF"stored_messages: %ui" CRLF"active_subscribers: %ui"
-#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN "  pid: %d" CRLF"  subscribers: %ui" CRLF"  uptime: %ui"
+#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_PLAIN_PATTERN "  pid: %d" CRLF"  subscribers: %ui" CRLF"  uptime: %ui" CRLF"  inbox: %ui" CRLF"  inbox_recovered: %ui"
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_PLAIN_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_PLAIN = ngx_string("hostname: %s, time: %s, channels: %ui, wildcard_channels: %ui, uptime: %ui, infos: " CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_PLAIN = ngx_string(CRLF);
@@ -63,7 +63,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_PLAIN = ngx_string("text/pla
 
 
 #define  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN "{\"channel\": \"%s\", \"published_messages\": %ui, \"stored_messages\": %ui, \"subscribers\": %ui}"
-#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN "{\"pid\": \"%d\", \"subscribers\": %ui, \"uptime\": %ui}"
+#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_JSON_PATTERN "{\"pid\": \"%d\", \"subscribers\": %ui, \"uptime\": %ui, \"inbox\": %ui, \"inbox_recovered\": %ui}"
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_JSON_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_JSON = ngx_string("{\"hostname\": \"%s\", \"time\": \"%s\", \"channels\": %ui, \"wildcard_channels\": %ui, \"uptime\": %ui, \"infos\": [" CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_JSON = ngx_string("]}" CRLF);
@@ -76,7 +76,7 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_JSON = ngx_string("applicati
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_X_JSON = ngx_string("text/x-json");
 
 #define  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN "  channel: %s" CRLF"  published_messages: %ui" CRLF"  stored_messages: %ui" CRLF"  subscribers: %ui"
-#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN "    pid: %d" CRLF"    subscribers: %ui" CRLF"    uptime: %ui"
+#define  NGX_HTTP_PUSH_STREAM_WORKER_INFO_YAML_PATTERN "    pid: %d" CRLF"    subscribers: %ui" CRLF"    uptime: %ui" CRLF"    inbox: %ui" CRLF"    inbox_recovered: %ui"
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML = ngx_string(NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_YAML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_YAML = ngx_string("hostname: %s" CRLF"time: %s" CRLF"channels: %ui" CRLF"wildcard_channels: %ui" CRLF"uptime: %ui" CRLF"infos: "CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_TAIL_YAML = ngx_string(CRLF);
@@ -101,6 +101,8 @@ static ngx_str_t  NGX_HTTP_PUSH_STREAM_CONTENT_TYPE_X_YAML = ngx_string("text/x-
     "  <pid>%d</pid>" CRLF \
     "  <subscribers>%ui</subscribers>" CRLF \
     "  <uptime>%ui</uptime>" CRLF \
+    "  <inbox>%ui</inbox>" CRLF \
+    "  <inbox_recovered>%ui</inbox_recovered>" CRLF \
     "</worker>" CRLF
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_XML = ngx_string("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" CRLF NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_XML_PATTERN CRLF);
 static ngx_str_t  NGX_HTTP_PUSH_STREAM_CHANNEL_INFO_GROUP_HEAD_XML = ngx_string("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>" CRLF "<root>" CRLF"  <hostname>%s</hostname>" CRLF"  <time>%s</time>" CRLF"  <channels>%ui</channels>" CRLF"  <wildcard_channels>%ui</wildcard_channels>" CRLF"  <uptime>%ui</uptime>" CRLF"  <infos>" CRLF);

@@ -60,6 +60,12 @@ ngx_http_push_stream_subscriber_handler(ngx_http_request_t *r)
     ngx_array_t                                    *event_id_parts;
     ngx_uint_t                                      channel_index;
 
+    /* reload in progress, see ngx_http_push_stream_worker_draining */
+    if (ngx_http_push_stream_worker_draining) {
+        r->keepalive = 0;
+        return ngx_http_push_stream_send_only_header_response(r, NGX_HTTP_SERVICE_UNAVAILABLE, NULL);
+    }
+
     // add headers to support cross domain requests
     if (cf->allowed_origins != NULL) {
         ngx_http_push_stream_complex_value(r, cf->allowed_origins, &vv_allowed_origins);

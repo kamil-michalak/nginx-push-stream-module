@@ -41,6 +41,13 @@ ngx_http_push_stream_publisher_handler(ngx_http_request_t *r)
 
     ngx_http_push_stream_set_expires(r, NGX_HTTP_PUSH_STREAM_EXPIRES_EPOCH, 0);
 
+    /* reload in progress: serve this request, then close, so the publisher's
+       next request goes to a new-generation worker (this one cannot wake
+       the new workers, see ngx_http_push_stream_worker_draining) */
+    if (ngx_http_push_stream_worker_draining) {
+        r->keepalive = 0;
+    }
+
 
     if (cf->allowed_origins != NULL) {
         ngx_http_push_stream_complex_value(r, cf->allowed_origins, &vv_allowed_origins);

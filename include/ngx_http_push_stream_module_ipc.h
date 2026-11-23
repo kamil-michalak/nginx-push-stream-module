@@ -69,6 +69,8 @@ static void             ngx_http_push_stream_alert_shutting_down_workers(void);
 
 
 static ngx_inline void  ngx_http_push_stream_process_worker_message(void);
+static void             ngx_http_push_stream_recover_worker_inbox(void);
+static void             ngx_http_push_stream_log_lost_alert(ngx_pid_t pid, ngx_int_t slot, ngx_log_t *log);
 static ngx_inline void  ngx_http_push_stream_census_worker_subscribers(void);
 static ngx_inline void  ngx_http_push_stream_cleanup_shutting_down_worker(void);
 

@@ -948,7 +948,7 @@ razy więcej), konfiguracja z `docker-setup` (`location_api_sockets.conf`,
 niezależnie. „Sprawdzone” = zweryfikowane ponownie w kodzie przy spisywaniu;
 reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
 
-### 🔴 28. Zgubiona pobudka IPC po reloadzie → worker na zawsze głuchy (przyczyna incydentu 22-23.11)  sprawdzone
+### 🔴 28. Zgubiona pobudka IPC po reloadzie → worker na zawsze głuchy (przyczyna incydentu 22-23.11)  sprawdzone, odtworzone  ✅ NAPRAWIONE (etap 1, po `bb65d44`)
 
 - Producent wysyła `CHECK_MESSAGES` tylko przy przejściu skrzynki pusta →
   niepusta (`ipc.c:581`, `ipc.c:607-621`). Skrzynkę opróżnia **wyłącznie** ten
@@ -993,7 +993,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   kontenera.** Diagnoza na żywym node: `strace -c -f -e trace=recvmsg -p <pid>`
   na każdym workerze przez ~20 s - głuchy worker ma ~0 wywołań.
 
-### 🔴 29. Po CLEANUP stary worker dalej przyjmuje subskrybentów, którzy głuchną
+### 🔴 29. Po CLEANUP stary worker dalej przyjmuje subskrybentów, którzy głuchną  odtworzone  ✅ NAPRAWIONE (etap 1: odmowa 503)
 
 - CLEANUP idzie przed spawnem nowych workerów (`setup.c:393`); stary worker
   finalizuje swoich subskrybentów, zeruje slot (`utils.c:834-903`), ale do
@@ -1009,7 +1009,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   CLEANUP odłożony o 1-2 s timerem, gdy nowe workery już przyjmują. Ryzyko
   niskie (odmowa) / średnie (odroczenie).
 
-### 🟠 30. Fan-out do workerów bez subskrybentów na kanale  sprawdzone
+### 🟠 30. Fan-out do workerów bez subskrybentów na kanale  sprawdzone  ⏸ przesunięte do etapu z #35
 
 - Wpis workera w `channel->workers_with_subscribers` powstaje przy pierwszej
   subskrypcji (`subscriber.c:950-977`), odejście tylko zmniejsza licznik
@@ -1028,8 +1028,14 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   `worker->subscribers == 0` (census faza 1 zeruje go chwilowo,
   `ipc.c:406-430`), **nie** zwalniać wpisu (`worker_msg->subscriptions_sentinel`
   wskazuje do środka). Ryzyko niskie.
+- **Nie w etapie 1:** samo pominięcie otwiera dziurę przy podłączaniu. Worker,
+  który przyjmuje właśnie pierwszego subskrybenta kanału, ma pusty wpis, dopóki
+  replay się nie skończy i subskrypcja się nie podepnie (#35). Publikacja w tym
+  oknie dziś trafia do jego skrzynki i jest dostarczana po podpięciu, a po
+  zmianie by przepadła. Robić razem z #35 (podpięcie w tym samym trzymaniu
+  `channel->mutex` co zbieranie replayu).
 
-### 🟠 31. Jedna referencja na głowie kolejki blokuje wygasanie całego bufora kanału  sprawdzone
+### 🟠 31. Jedna referencja na głowie kolejki blokuje wygasanie całego bufora kanału  sprawdzone  ✅ NAPRAWIONE (etap 1)
 
 - `ensure_qtd_of_messages()` w trybie expired przerywa na pierwszej
   wiadomości z `REFS > 0` (`utils.c:552`); nowsze czekają na limit 512, który
@@ -1221,7 +1227,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   przez `get_channel()`; `set_channel_startup_message` odświeża `expires`.
   Ryzyko niskie, częstość niska.
 
-### 🟡 43. `clean_worker_data` opróżnia skrzynkę przed wypisaniem z kanałów  sprawdzone
+### 🟡 43. `clean_worker_data` opróżnia skrzynkę przed wypisaniem z kanałów  sprawdzone  ✅ NAPRAWIONE (etap 1)
 
 - `ipc.c:277-298`: najpierw drain, potem `unsubscribe_worker` po ~4,7k
   kanałach (każdy z `channel->mutex`, milisekundy) - wiadomości wstawione w
@@ -1232,7 +1238,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
 - Poprawka: najpierw wypisanie ze wszystkich kanałów (bez `break`), potem
   drain, drugi drain na końcu. Ryzyko niskie.
 
-### 🟢 44. NULL deref przy pełnym shm  sprawdzone
+### 🟢 44. NULL deref przy pełnym shm  sprawdzone  ✅ NAPRAWIONE (etap 1)
 
 - `delete_channel` może zostawić `channel_deleted_message == NULL`
   (`utils.c:2221-2226`), a `delete_channels_data` i tak woła
@@ -1267,6 +1273,85 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   klucze rosną i po cichu wpadają do `__overflow__`.
 - `/api/live/lp` ma `gzip on` - ta sama wiadomość kompresowana osobno dla
   każdego subskrybenta long-pollingu.
+
+### Etap 1 - wynik (2026-11-23, working tree po `bb65d44`)
+
+**Zmiany:**
+- **#28:**
+  - `broadcast()` przy braku socketpaira do slotu albo błędzie zapisu ustawia
+    `ipc[slot].alert_lost`; `send_worker_message()` alarmuje wtedy mimo
+    niepustej skrzynki, a właściciel kasuje flagę przy opróżnianiu.
+  - Rate-limited WARN „could not wake worker”.
+  - Timer 4 s (`recover_worker_inbox`) opróżnia skrzynkę, której najstarsza
+    wiadomość czeka ≥ 2 s (`worker_msg->queued`), z WARN „wake-up was lost”.
+  - `by_worker` w statystykach (4 formaty) ma `inbox` (wiadomości w skrzynce)
+    i `inbox_recovered` (ile razy timer musiał ratować; > 0 = zgubiona
+    pobudka).
+  - Licznik skrzynki przez wskaźnik do shm w `worker_msg`, nie przez
+    `worker_msg->mcf`: to pamięć procesu producenta, a po reloadzie
+    konsument może być z innej generacji.
+- **#29:**
+  - Flaga `ngx_http_push_stream_worker_draining` ustawiana przy CLEANUP /
+    wyjściu.
+  - Handler subskrybenta i WebSocket w takim workerze zwraca 503 (klient
+    łączy się ponownie, do nowego workera).
+  - Publisher robi `keepalive = 0`, więc emit po tej publikacji przechodzi na
+    nowy worker, którego alerty działają.
+- **#31:** bez warunku `REFS > 0` w teście wygaśnięcia.
+- **#43:** wypisanie ze wszystkich kanałów (wszystkie wpisy procesu / slotu,
+  bez `break`), potem opróżnienie skrzynki.
+- **#44:** pominięcie wysyłki NULL `channel_deleted_message`.
+
+**Odtworzenie #28 (deterministyczne):**
+- Ustawienia: nginx 1.31.9, 8 workerów, publisher keep-alive na starym
+  workerze, `SIGHUP`, po 25 ms 40 subskrybentów (część trafia na nowe
+  workery), 10 publikacji starym połączeniem w oknie CLEANUP → SIGQUIT, potem
+  20 publikacji nowym połączeniem.
+- „Głuchy” = nie dostał żadnej z tych 20.
+
+| wariant | głusi (8 prób × 40) | skrzynki nowych workerów |
+|---|---|---|
+| `test30` (`b866b1d`, kod z prod + atomic) | **40/40 w każdej próbie** | (brak licznika) |
+| etap 1 bez zabezpieczeń (liczniki zostają) | **40/40 w każdej próbie** | każda 30 wiadomości, rośnie |
+| tylko timer (bez `alert_lost` i 503) | 2-10 (po 7 s) | opróżnione po 2-6 s |
+| etap 1 | **0** | 0; 1 zgubiony alert na próbę naprawiony przez `alert_lost` |
+
+Przy „tylko timer” zostają subskrybenci przyjęci przez stary worker po CLEANUP:
+jego timer jest skasowany, a slot nieaktywny. To naprawia #29, dlatego w pełnym
+etapie 1 jest 0. W etapie 1 1-12 z 40 podłączeń w oknie dostaje 503 od starego
+workera (klient łączy się ponownie).
+
+Losowy test reloadu (400-600 auto-reconnectujących subskrybentów, publisher
+non-stop, 32 workery, 6-8 reloadów) okno trafiał rzadko (1 zgubiony alert na
+3 reloady w wariancie z logowaniem) - na prodzie okno trafia częściej, bo
+reconnecty rozkładają się na setki ms (TLS, sieć mobilna), a emit publikuje
+bez przerw.
+
+**Test wycieku** (scenariusz z #27): 30 s / 300 i 60 s / 600 - wszystko 0, bez
+alertów.
+
+**Wydajność:**
+- Pierwsza wersja miała podłączenia/s niżej w 7 z 7 rund (−14%). Przyczyna:
+  dwa pola po 8 B powiększyły `worker_msg` z 56 do 72 B, czyli slab z kubełka
+  64 B do 128 B, plus dwa `lock xadd` na każdą wiadomość IPC.
+- Poprawka:
+  - `queued` jako `uint32_t` w dziurze wyrównania po `pid`;
+  - liczniki zwykłym `++`/`--` (oba miejsca są pod `shpool->mutex`);
+  - sprawdzenie w czasie kompilacji `sizeof(worker_msg) <= 64`.
+- Po niej, 4 rundy na zmianę z `test30`:
+
+| wariant | publikacje/s | podłączenia/s |
+|---|---|---|
+| `test30` | 9 196 | 7 848 |
+| etap 1 | 9 296 | 7 746 |
+
+W szumie; każdy wariant wygrał 2 rundy (host był wolniejszy niż przy
+pomiarach z #27, ale porównanie jest w parach).
+
+**Wdrożenie:** zmienia się układ shm (`ipc[]`, `worker_msg`), więc pełny
+restart kontenera nginx-frontend, nie reload. Po wdrożeniu: `inbox_recovered`
+i log „could not wake worker” / „wake-up was lost” pokażą, jak często to się
+działo.
 
 ### Plan etapów
 

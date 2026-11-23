@@ -98,7 +98,7 @@ ngx_http_push_stream_send_response_all_channels_info_summarized(ngx_http_request
     }
 
     len = (subtype->format_summarized_worker_item->len > subtype->format_summarized_worker_last_item->len) ? subtype->format_summarized_worker_item->len : subtype->format_summarized_worker_last_item->len;
-    len = used_slots * (3*NGX_INT_T_LEN + len - 8); //minus 8 sprintf
+    len = used_slots * (5*NGX_INT_T_LEN + len - 14); //minus 14 sprintf (%d + 4x %ui)
     if ((subscribers_by_workers = ngx_pcalloc(r->pool, len)) == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate memory to write workers statistics.");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -108,7 +108,7 @@ ngx_http_push_stream_send_response_all_channels_info_summarized(ngx_http_request
         worker_data = data->ipc + j;
         if (worker_data->pid > 0) {
             format = (i < used_slots - 1) ? subtype->format_summarized_worker_item : subtype->format_summarized_worker_last_item;
-            start = ngx_sprintf(start, (char *) format->data, worker_data->pid, worker_data->subscribers, ngx_time() - worker_data->startup);
+            start = ngx_sprintf(start, (char *) format->data, worker_data->pid, worker_data->subscribers, ngx_time() - worker_data->startup, worker_data->inbox, worker_data->inbox_recovered);
             i++;
         }
     }
