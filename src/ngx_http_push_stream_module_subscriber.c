@@ -751,7 +751,6 @@ ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *ch
 static void
 ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id)
 {
-    ngx_http_push_stream_main_conf_t      *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_msg_t            *message;
     ngx_queue_t                           *q;
@@ -825,22 +824,10 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
 
     /* take the reference BEFORE dropping the lock - see the function
        comment above for why this is what makes sending outside
-       channel->mutex, below, safe.
-       workers_ref_count is guarded by shpool->mutex, NOT channel->mutex:
-       every decrement (below, send_startup_message,
-       free_worker_message_memory) and the IPC fan-out increment
-       (send_worker_message) run under shpool->mutex in other processes,
-       so a ++ under channel->mutex alone is a lost-update race. A lost
-       decrement leaves the count > 0 forever and the message can never
-       leave the trash (shm exhausted on s1 2026-11-23); a lost increment
-       lets it be freed while still referenced. Order channel->mutex ->
-       shpool->mutex is the one broadcast() already uses. */
-    if (to_send_count > 0) {
-        ngx_shmtx_lock(&mcf->shpool->mutex);
-        for (i = 0; i < to_send_count; i++) {
-            to_send[i]->workers_ref_count++;
-        }
-        ngx_shmtx_unlock(&mcf->shpool->mutex);
+       channel->mutex, below, safe (atomic, see
+       NGX_HTTP_PUSH_STREAM_MSG_REF) */
+    for (i = 0; i < to_send_count; i++) {
+        NGX_HTTP_PUSH_STREAM_MSG_REF(to_send[i]);
     }
 
     ngx_shmtx_unlock(channel->mutex);
@@ -849,12 +836,8 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
         ngx_http_push_stream_send_response_message(r, channel, to_send[i], 0, ctx->message_sent);
     }
 
-    if (to_send_count > 0) {
-        ngx_shmtx_lock(&mcf->shpool->mutex);
-        for (i = 0; i < to_send_count; i++) {
-            to_send[i]->workers_ref_count--;
-        }
-        ngx_shmtx_unlock(&mcf->shpool->mutex);
+    for (i = 0; i < to_send_count; i++) {
+        (void) NGX_HTTP_PUSH_STREAM_MSG_UNREF(to_send[i]);
     }
 }
 
@@ -916,7 +899,6 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
 static ngx_flag_t
 ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel)
 {
-    ngx_http_push_stream_main_conf_t      *mcf = ngx_http_get_module_main_conf(r, ngx_http_push_stream_module);
     ngx_http_push_stream_module_ctx_t     *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
     ngx_http_push_stream_msg_t            *msg;
     ngx_str_t                             *boundary_event_id = NULL;
@@ -945,19 +927,14 @@ ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_s
         }
     }
     /* see the long comment above this function for why this reference is
-       what makes sending outside channel->mutex, below, safe; under
-       shpool->mutex like every other workers_ref_count change (see
-       send_old_messages) */
-    ngx_shmtx_lock(&mcf->shpool->mutex);
-    msg->workers_ref_count++;
-    ngx_shmtx_unlock(&mcf->shpool->mutex);
+       what makes sending outside channel->mutex, below, safe (atomic, see
+       NGX_HTTP_PUSH_STREAM_MSG_REF) */
+    NGX_HTTP_PUSH_STREAM_MSG_REF(msg);
     ngx_shmtx_unlock(channel->mutex);
 
     ngx_http_push_stream_send_response_message(r, channel, msg, 0, ctx->message_sent);
 
-    ngx_shmtx_lock(&mcf->shpool->mutex);
-    msg->workers_ref_count--;
-    ngx_shmtx_unlock(&mcf->shpool->mutex);
+    (void) NGX_HTTP_PUSH_STREAM_MSG_UNREF(msg);
 
     /* replay the buffer from the boundary: the snapshot's Event-Id if it has
        one, otherwise the stream position captured when it was set */

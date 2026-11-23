@@ -354,9 +354,30 @@ struct ngx_http_push_stream_msg_s {
      */
     ngx_http_push_stream_chunk_t  **formatted_chunks;
     ngx_http_push_stream_chunk_t  **compressed_chunks;
-    ngx_int_t                       workers_ref_count;
+    ngx_atomic_t                    workers_ref_count;  /* only via NGX_HTTP_PUSH_STREAM_MSG_REF / _UNREF / _REFS */
     ngx_uint_t                      qtd_templates;
 };
+
+/*
+ * msg->workers_ref_count is changed from several worker processes that hold
+ * different locks at that moment: send_old_messages() / send_startup_message()
+ * under channel->mutex, send_worker_message() / free_worker_message_memory()
+ * under shpool->mutex. A plain ++/-- under two different locks loses updates:
+ * a lost decrement keeps the count > 0 forever, so the message never leaves
+ * the trash and a stored message never expires (s1 2026-11-23: 4.75M messages
+ * in trash, 24 GB zone full, every publish 500); a lost increment frees a
+ * message a send buffer still points into. Atomic read-modify-write needs no
+ * lock at all, so the reference no longer adds shpool->mutex traffic.
+ * The field is unsigned (ngx_atomic_t); read it signed through _REFS so an
+ * unbalanced decrement shows up as <= 0, as with the old ngx_int_t.
+ */
+#define NGX_HTTP_PUSH_STREAM_MSG_REF(msg)                                     \
+    (void) ngx_atomic_fetch_add(&(msg)->workers_ref_count, 1)
+/* returns the count after the decrement */
+#define NGX_HTTP_PUSH_STREAM_MSG_UNREF(msg)                                   \
+    ((ngx_atomic_int_t) ngx_atomic_fetch_add(&(msg)->workers_ref_count, -1) - 1)
+#define NGX_HTTP_PUSH_STREAM_MSG_REFS(msg)                                    \
+    ((ngx_atomic_int_t) (msg)->workers_ref_count)
 
 /*
  * Content-addressed cache entry for "native" streaming ping messages,

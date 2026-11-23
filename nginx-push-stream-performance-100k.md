@@ -887,9 +887,31 @@ kanał. Zgubione `++` → zwolnienie wiadomości, do której wskazuje jeszcze
 bufor wysyłki (use-after-free). Okno wyścigu otwiera każde podłączenie
 subskrybenta (startup message + replay), czyli burze reconnectów.
 
-**Poprawka:** oba `++` pod `shpool->mutex` (zagnieżdżony w `channel->mutex`,
-ta sama kolejność co `broadcast()` → `send_worker_message`; nigdzie nie ma
-odwrotnej kolejności).
+**Poprawka:** `workers_ref_count` jest `ngx_atomic_t` i zmienia się tylko
+przez `NGX_HTTP_PUSH_STREAM_MSG_REF` / `_UNREF` (`ngx_atomic_fetch_add`),
+czytany przez `_REFS` (ze znakiem, jak dawny `ngx_int_t`). Wszystkie 6 miejsc
+naraz - połowa atomowo, połowa pod lockiem byłaby dalej wyścigiem. Zmiana
+licznika nie potrzebuje już żadnego locka: `send_old_messages()` i
+`send_startup_message()` nie biorą `shpool->mutex` przy `--` (wcześniej
+brały), `send_worker_message()` / `free_worker_message_memory()` biorą go
+jak dotąd, ale tylko dla alokacji / zwolnienia. Wariant pośredni (oba `++`
+pod `shpool->mutex` zagnieżdżonym w `channel->mutex`) też naprawiał wyciek,
+ale dokładał przejęcie globalnego locka przy każdym podłączeniu.
+
+**Wydajność** (nginx 1.31.9, 4 workery na 3 rdzeniach, generator na 5
+osobnych, nginx ~91% CPU; 1500 stałych połączeń stream na 50 kanałach, 24
+publishery keep-alive 1,5 KB z 20% `Startup-Message: 1`, 450 pętli churnu
+podłączeń; 4 rundy × 20 s, kolejność rotowana, średnie):
+
+| wariant | publikacje/s | p99 publikacji | churn/s |
+|---|---|---|---|
+| bez poprawki (`f6f8714`) | 14 084 | 11,7 ms | 7 758 |
+| `++` pod `shpool->mutex` | 14 065 | 11,5 ms | 7 935 |
+| atomowo (`test30`) | 14 023 | 10,6 ms | 7 902 |
+
+Różnice w szumie (ten sam wariant ±15% między rundami). Przy 32 workerach na
+prodzie kontencja na `shpool->mutex` jest większa; wariant atomowy zdejmuje z
+niego przejęcia, więc nie może być gorszy.
 
 **Test lokalny** (nginx 1.31.9, 16 workerów z reuseport, `message_ttl 5s`, 4
 kanały, 8 publisherów, co 3. publikacja `Startup-Message: 1`, 300-600
@@ -901,6 +923,7 @@ równoległych pętli krótkich subskrypcji stream; po obciążeniu 60 s ciszy):
 | 30 s / 300 | trash 11 | trash 0 |
 | 60 s / 600 | trash 8 + 39 stored, 2 kanały nie znikają | wszystko 0 |
 
+Wariant atomowy w tym samym teście: 30 s / 300 i 60 s / 600 - wszystko 0.
 Wszystkie buildy `-Werror -Wall`, bez alertów w logu.
 
 **Otwarte:** ten wyścig tłumaczy przeciek, ale nie to, dlaczego na s1/s2

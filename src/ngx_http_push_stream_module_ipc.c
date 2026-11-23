@@ -572,7 +572,7 @@ ngx_http_push_stream_send_worker_message(ngx_http_push_stream_channel_t *channel
         return NGX_ERROR;
     }
 
-    msg->workers_ref_count++;
+    NGX_HTTP_PUSH_STREAM_MSG_REF(msg);
     newmessage->msg = msg;
     newmessage->pid = pid;
     newmessage->subscriptions_sentinel = subscriptions_sentinel;

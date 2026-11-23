@@ -549,7 +549,7 @@ ngx_http_push_stream_ensure_qtd_of_messages(ngx_http_push_stream_shm_data_t *dat
         q = ngx_queue_head(&channel->message_queue);
         msg = ngx_queue_data(q, ngx_http_push_stream_msg_t, queue);
 
-        if (expired && (msg->deleted || (msg->expires == 0) || (msg->expires > ngx_time()) || (msg->workers_ref_count > 0))) {
+        if (expired && (msg->deleted || (msg->expires == 0) || (msg->expires > ngx_time()) || (NGX_HTTP_PUSH_STREAM_MSG_REFS(msg) > 0))) {
             break;
         }
 
@@ -2554,7 +2554,7 @@ ngx_http_push_stream_free_memory_of_expired_messages_and_channels_data(ngx_http_
         next = ngx_queue_next(cur);
         message = ngx_queue_data(cur, ngx_http_push_stream_msg_t, queue);
 
-        if (force || ((message->workers_ref_count <= 0) && (ngx_time() > message->expires))) {
+        if (force || ((NGX_HTTP_PUSH_STREAM_MSG_REFS(message) <= 0) && (ngx_time() > message->expires))) {
             ngx_queue_remove(&message->queue);
             ngx_queue_insert_tail(&freeable, &message->queue);
             NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER(data->messages_in_trash);
@@ -2634,8 +2634,7 @@ static void
 ngx_http_push_stream_free_worker_message_memory(ngx_slab_pool_t *shpool, ngx_http_push_stream_worker_msg_t *worker_msg)
 {
     ngx_shmtx_lock(&shpool->mutex);
-    worker_msg->msg->workers_ref_count--;
-    if ((worker_msg->msg->workers_ref_count <= 0) && worker_msg->msg->deleted) {
+    if ((NGX_HTTP_PUSH_STREAM_MSG_UNREF(worker_msg->msg) <= 0) && worker_msg->msg->deleted) {
         worker_msg->msg->expires = ngx_time() + NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL;
     }
     ngx_queue_remove(&worker_msg->queue);
