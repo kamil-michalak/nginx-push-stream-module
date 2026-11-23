@@ -926,13 +926,359 @@ równoległych pętli krótkich subskrypcji stream; po obciążeniu 60 s ciszy):
 Wariant atomowy w tym samym teście: 30 s / 300 i 60 s / 600 - wszystko 0.
 Wszystkie buildy `-Werror -Wall`, bez alertów w logu.
 
-**Otwarte:** ten wyścig tłumaczy przeciek, ale nie to, dlaczego na s1/s2
+**Otwarte → wyjaśnione w #28** (zgubiona pobudka IPC po reloadzie). Pierwotna
+notatka: ten wyścig tłumaczy przeciek, ale nie to, dlaczego na s1/s2
 ruszył w jednej chwili (~34 min po reloadzie 22.11 18:40, przy `message_ttl
 10m`), a na s3 wcale. Przed restartem s1 miał 16 workerów po ~250
 subskrybentów i 16 po ~730 (s2/s3 równo) - możliwe, że część workerów
 przestała odbierać IPC. Do zbadania na s2 przed jego restartem. Pomogłyby
 metryki: długość kolejki IPC per worker w `by_worker` i liczba wiadomości w
 koszu z `workers_ref_count > 0` starszych niż kilka minut.
+
+---
+
+## Pełny przegląd 2026-11-23 (`test30`, po incydencie s1)
+
+Trzy niezależne przeglądy kodu (publikacja + IPC; subskrybent + WebSocket;
+pamięć, sprzątanie, statystyki, reload) na kontekście prod: 32 workery, 24 GB
+strefa, `message_ttl 10m`, 512 wiadomości / kanał, ~4,7k kanałów, 14-23k
+subskrybentów / node, ~380 publikacji kanałowych/s średnio (fale meczowe kilka
+razy więcej), konfiguracja z `docker-setup` (`location_api_sockets.conf`,
+`push_http.conf`, `push_stat_api.conf`). Punkt 28 znalazły wszystkie trzy
+niezależnie. „Sprawdzone” = zweryfikowane ponownie w kodzie przy spisywaniu;
+reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
+
+### 🔴 28. Zgubiona pobudka IPC po reloadzie → worker na zawsze głuchy (przyczyna incydentu 22-23.11)  sprawdzone
+
+- Producent wysyła `CHECK_MESSAGES` tylko przy przejściu skrzynki pusta →
+  niepusta (`ipc.c:581`, `ipc.c:607-621`). Skrzynkę opróżnia **wyłącznie** ten
+  alert i event wznowienia partii (`ipc.c:482-510`); timer 4 s
+  (`utils.c:2454-2471`) jej nie sprawdza.
+- `alert_worker()` przy `socketpairs[slot][0] == NGX_INVALID_FILE` zwraca
+  `NGX_OK` bez wysyłki i bez logu (`ipc.c:370-373`). Błąd/`EAGAIN`
+  `ngx_write_channel` jest logowany raz i nie ponawiany (`ipc.c:617-620`).
+- Reload: master w `init_module` tworzy pary dla nowych slotów i unieważnia
+  stare (`setup.c:392-393` → `ipc.c:101-161`, `ipc.c:231-244`) **przed**
+  forkiem nowych workerów. Stare workery mają więc dla każdego nowego slotu
+  INVALID (sprawdzone dla 1. reloadu i przeplotu slotów 0..31 / 32..63).
+- Okno: od CLEANUP (wysyłany z `init_module`) do SIGQUIT (po 32 forkach +
+  `ngx_msleep(100)`) plus publikacje w locie. Stary worker obsługuje
+  keep-alive POST-y emit workera, a nowe workery mają już subskrybentów z
+  burzy reconnectów, którą wywołał sam CLEANUP. Pierwsza publikacja starego
+  workera do nowego z pustą skrzynką gubi pobudkę; potem nikt już nie
+  alarmuje.
+- Skutek: subskrybenci tego workera dostają pingi, ale nie dane; każdy
+  `worker_msg` w skrzynce trzyma referencję → wiadomości nie wygasają (#31),
+  bufor kanału rośnie do 512, przepełnienie idzie do kosza i tam zostaje.
+  Pasuje do obserwacji: s1 16 workerów po ~250 i 16 po ~730 subskrybentów
+  (klienci z watchdogiem odpływają od głuchych), start w chwili reloadu i
+  widoczny wzrost kosza po ~34 min (zapełnienie 512 przy ~0,25 msg/s), s3
+  czysty (w jego oknie żadna publikacja nie trafiła w nowy worker).
+  **`test30` tego nie naprawia - kolejny reload przy ruchu może to powtórzyć.**
+- Poprawka:
+  - (a) samoleczenie: w timerze 4 s, jeśli
+    `!ngx_queue_empty(&data->ipc[ngx_process_slot].messages_queue)`, wołać
+    `process_worker_message()` i logować WARN (= zgubiona pobudka). Najgorszy
+    przypadek to 4 s opóźnienia, mniej niż 10 s grace kanału w koszu;
+  - (b) `alert_worker()` zwraca błąd + rate-limited log przy INVALID / błędzie
+    zapisu, a slot dostaje w shm flagę `alert_lost`, przez którą następny
+    producent alarmuje mimo niepustej skrzynki;
+  - (c) długość skrzynki i wiek najstarszego `worker_msg` per worker w
+    `by_worker` (licznik w `send_worker_message` / `free_worker_message_memory`,
+    oba już pod `shpool->mutex`).
+- Ryzyko niskie (przetwarzanie skrzynki jest idempotentne). Test: 4-8
+  workerów, publisher keep-alive ~200 req/s, `nginx -s reload`, subskrybenci
+  na nowych workerach - część nie dostaje nic bez poprawki.
+- Do czasu wdrożenia: **na frontendach zamiast `nginx -s reload` pełny restart
+  kontenera.** Diagnoza na żywym node: `strace -c -f -e trace=recvmsg -p <pid>`
+  na każdym workerze przez ~20 s - głuchy worker ma ~0 wywołań.
+
+### 🔴 29. Po CLEANUP stary worker dalej przyjmuje subskrybentów, którzy głuchną
+
+- CLEANUP idzie przed spawnem nowych workerów (`setup.c:393`); stary worker
+  finalizuje swoich subskrybentów, zeruje slot (`utils.c:834-903`), ale do
+  SIGQUIT przyjmuje połączenia. Klient, który wraca od razu (50-150 ms TLS),
+  trafia częściowo do starego workera, dostaje snapshot + replay i potem nic:
+  nowe workery mają jego slot jako INVALID, pingi stoją (`timer_reset` przy
+  `ngx_exiting`, `utils.c:2675`). Połączenie żyje do `worker_shutdown_timeout`
+  (120 s), wiadomości w skrzynce trzymają referencje do wyjścia workera.
+  Prawdopodobne źródło „podwójnej fali” po reloadzie.
+- Poprawka: flaga „draining” ustawiana w `cleanup_shutting_down_worker`;
+  handler subskrybenta / WS w takim workerze odrzuca przed rejestracją (503 /
+  close), krótki timer powtarza cleanup, jeśli coś się prześlizgnęło. Lepiej:
+  CLEANUP odłożony o 1-2 s timerem, gdy nowe workery już przyjmują. Ryzyko
+  niskie (odmowa) / średnie (odroczenie).
+
+### 🟠 30. Fan-out do workerów bez subskrybentów na kanale  sprawdzone
+
+- Wpis workera w `channel->workers_with_subscribers` powstaje przy pierwszej
+  subskrypcji (`subscriber.c:950-977`), odejście tylko zmniejsza licznik
+  (`utils.c:3019-3027`, `websocket.c:256-260`); wpis znika dopiero przy
+  zwolnieniu kanału / czyszczeniu workera. Kanał żyje dniami, reuseport
+  rozrzuca reconnecty, więc długowieczny kanał ma ~32 wpisy.
+- `broadcast()` (`ipc.c:602-613`) robi dla każdego wpisu `worker_msg`
+  (alloc pod `shpool->mutex`, przy trzymanym `channel->mutex`), referencję,
+  często alert (`write` + wybudzenie) i u odbiorcy `recvmsg` + free pod
+  `shpool->mutex` - dla nikogo. Rząd wielkości: do ~12k `worker_msg`/s
+  średnio, ~10× w falach; ~2× tyle przejęć `shpool->mutex` (ten sam lock,
+  na którym 2026-10-10 czekało 26 z 32 workerów). Wzmacnia #28: głuchy worker
+  dostaje wiadomości ze wszystkich kanałów, których kiedykolwiek dotknął.
+- Poprawka: w `broadcast()` `if (ngx_queue_empty(&worker->subscriptions))
+  continue;` (kolejka zmieniana tylko pod `channel->mutex`). **Nie**
+  `worker->subscribers == 0` (census faza 1 zeruje go chwilowo,
+  `ipc.c:406-430`), **nie** zwalniać wpisu (`worker_msg->subscriptions_sentinel`
+  wskazuje do środka). Ryzyko niskie.
+
+### 🟠 31. Jedna referencja na głowie kolejki blokuje wygasanie całego bufora kanału  sprawdzone
+
+- `ensure_qtd_of_messages()` w trybie expired przerywa na pierwszej
+  wiadomości z `REFS > 0` (`utils.c:552`); nowsze czekają na limit 512, który
+  referencji nie sprawdza. Jedna długa referencja (głucha skrzynka, wolny
+  klient) trzyma do 512 wiadomości kanału - stąd ~740k `stored_messages` na
+  s1 (~1,4k kanałów × 512) i opóźnienie wzrostu kosza z #28.
+- Poprawka: usunąć warunek `REFS` z testu wygaśnięcia - wiadomość idzie do
+  kosza, a kosz i tak zwalnia dopiero przy `REFS <= 0`; `send_old_messages`
+  działa na zebranej tablicy wskaźników, IPC na `worker_msg->msg`, nikt nie
+  chodzi po `msg->queue` po zwolnieniu locka. Ryzyko niskie (sprawdzić
+  pozostałe wywołania).
+
+### 🟠 32. Sweep sprzątający ~8×/s na node zamiast co 4 s; kosz chodzony w całości pod `messages_trash_mutex`  sprawdzone
+
+- Każdy z 32 workerów ma `memory_cleanup` co 4 s i `buffer_cleanup` co 5 s
+  (`utils.c:2454-2490`, `setup.h:37-39`); `trylock(cleanup_mutex)` chroni
+  tylko przed nakładaniem się, nie ma znacznika ostatniego przebiegu. Timery
+  nie są zsynchronizowane → ~8 pełnych sweepów/s. Każdy: ~4,7k kanałów pod
+  globalnym `channels_queue_mutex`, 4,7k trylocków, cały kosz. Normalnie
+  ~30 ms CPU/s i 5-10 ms/s trzymania globalnego locka na node (~30× za dużo).
+- W incydencie: 4,75 mln wpisów kosza = ~0,5-1 s chodzenia po wskaźnikach na
+  przebieg pod `messages_trash_mutex`, żądane 8×/s → lock trzymany prawie
+  ciągle, a każde `throw_the_message_away` (każda publikacja przez
+  `ensure_qtd`) na nim spało - konwój dokładnie przy presji na pamięć.
+- Poprawka: `data->last_sweep` sprawdzany pod `cleanup_mutex` (pomiń, jeśli
+  młodszy niż interwał; `buffer_cleanup` wtedy zbędny); wiadomości wygasłe z
+  `REFS > 0` przenosić do osobnej kolejki `messages_pinned` sprawdzanej co
+  30-60 s i wystawionej w statystykach (metryka, której brakowało w #27).
+  Główny kosz może wtedy znowu kończyć na pierwszym niewygasłym wpisie (FIFO
+  = kolejność wygasania). Ryzyko niskie.
+
+### 🟠 33. 4 szablony = 7 kopii treści każdej wiadomości (podnosi #4 i #24)
+
+- `push_http.conf:8` ustawia na poziomie http szablon kopertowy
+  (`{"id":~id~,"eventid":...,"text":...}`), dziedziczony przez lokacje z
+  `push_subscriber_ws.conf` / `push_subscriber_lp.conf`; `/api/live/*` mają
+  `"~text~\n"`. Szablony są deduplikowane po tekście + fladze websocket
+  (`module.c:345-357`) → 4 szablony, a każda wiadomość jest formatowana dla
+  wszystkich (`utils.c:1350-1437`): surowa treść + 4 sformatowane + 2
+  skompresowane (oba szablony ws z deflate), każda zaokrąglona do kubełka
+  (`utils.c:210-229`). 3 KB treści → ~23 KB shm (~7,7×); kanał `/api/live`
+  czyta 1 z 7 kopii.
+- Wszystko pod `channel->mutex` (`utils.c:1569`): ~10 memcpy rozmiaru treści i
+  6+ alokacji; powyżej 4 KB każda kopia to łańcuch 1-stronicowych chunków,
+  jedno przejęcie `shpool->mutex` na chunk. Snapshot 300 KB ≈ 400 przejęć i
+  ~1,6 MB shm.
+- Poprawka docelowa: dla szablonów z jednym `~text~` (bez eventsource)
+  przechowywać tylko prefiks i sufiks i wysyłać `[prefiks][chunki surowej
+  treści][sufiks]` zero-copy; dla deflate jedna współdzielona, refcountowana
+  kopia skompresowanego tekstu na publikację. ~1,25× zamiast ~7× i mniej
+  alokacji pod `channel->mutex`, bez zmiany kolejności. Doraźnie: sprawdzić,
+  czy lokacje z szablonem kopertowym są jeszcze używane; jeśli nie, usunąć
+  szablon z poziomu http (2 szablony mniej). Ryzyko średnie (wszystkie ścieżki
+  wysyłki).
+
+### 🟠 34. `shpool->mutex` ~15 + 2W razy na publikację, głównie pod `channel->mutex` (podnosi #24)
+
+- Osobne samoblokujące alokacje: struktura msg, 4 tablice, event id
+  (wartość + wiadomość, `utils.c:909/925`), każda kopia szablonu, ref surowej
+  treści (`utils.c:454`), czas/tag globalny (`utils.c:1557-1566`), w
+  publisherze alloc + unref surowej treści (`publisher.c:367/391`), w IPC po
+  jednym na workera u nadawcy (`ipc.c:568-583`) i u odbiorcy
+  (`utils.c:2634-2643`). Przy W = 32 ~80 przejęć na publikację; liczniki
+  publikacji wciąż pod globalnym `channels_queue_mutex` (`utils.c:1597-1609`,
+  niezrobiona część #16).
+- Poprawka: (a) wszystkie `worker_msg` broadcastu pod jednym przejęciem
+  (`ngx_slab_alloc_locked`), odbiorca zwalnia partią; docelowo własny lock i
+  lista wolnych węzłów per slot (IPC bez `shpool`); (b) msg + 4 tablice +
+  event id jedną alokacją (rozmiar stały dla konfiguracji); (c) pomijać
+  `event_id_message` / `event_type_message` bez szablonu eventsource (prod
+  nie ma); (d) atomiki dla refcountu surowej treści, `last_message_time/tag`,
+  `published_messages` / `stored_messages`. Cel ~6-10 przejęć. Ryzyko
+  niskie-średnie; zmierzyć czasy trzymania.
+
+### 🟠 35. Replay i dostawa na żywo ścigają się przy podłączeniu: duplikaty, rzadko dziury
+
+- Replay zbierany i lock zwalniany (`subscriber.c:829-833`), wysyłka, dopiero
+  potem podpięcie subskrypcji (`subscriber.c:477`); publikacja wstawia do
+  kolejki i zwalnia lock (`utils.c:1588-1591`) przed `broadcast()`.
+  `respond_to_subscribers` (`ipc.c:629-665`) dostarcza wszystkim podpiętym bez
+  granicy. Wiadomość z replayu, która jest jeszcze w skrzynce workera albo nie
+  została rozgłoszona, przychodzi drugi raz; w burzy (skrzynka opóźniona o
+  partie po 32) duplikaty na gorących kanałach są prawdopodobne. Szablon
+  `"~text~\n"` nie niesie id. Łagodzi to treść: patche z emit workera zaczynają
+  się od `{"op":"test","path":"/change/meta/id",...}`, więc duplikat nie
+  przejdzie testu - zależnie od klienta to resync zamiast zepsutego stanu
+  (sprawdzić, co robi frontend).
+- Dziura: wiadomość opublikowana między zebraniem a podpięciem ginie, jeśli
+  worker nie ma jeszcze wpisu na kanale (rzadkie, bo #30). `to_send_max`
+  czytany przed lockiem (`subscriber.c:769`) obcina najnowsze.
+- Poprawka: podpinać subskrypcję w tym samym trzymaniu `channel->mutex` co
+  zbieranie, zapamiętać `subscription->min_id = channel->last_message_id` i w
+  `respond_to_subscribers` pomijać `msg->id <= min_id`; rozmiar tablicy pod
+  lockiem. Ryzyko średnie.
+
+### 🟡 36. Replay przy podłączeniu: 4 przejścia kolejki pod `channel->mutex` i flush per wiadomość (podnosi #20)
+
+- Reconnect WS z `$arg_event` chodzi po kolejce od głowy 4× na kanał:
+  pre-check DISCONNECT (`websocket.c:416-448`), check przy podpięciu
+  (`subscriber.c:427`), check w `send_old_messages` (`subscriber.c:762`) i
+  zbieranie (`subscriber.c:799-822`); świeży z snapshotem 2×. Klient zwykle
+  blisko ogona → ~512 węzłów na przejście, ~0,4-0,6 ms trzymania na kanał.
+  Każda wiadomość replayu to osobne wywołanie output filtra z `flush=1`
+  (`utils.c:2053`) = osobny rekord TLS i `send()`.
+- Poprawka: jedno przejście od ogona (`ngx_queue_last`/`prev`), które
+  rozstrzyga FOUND/NOT_FOUND i zbiera; pre-check używa wyniku. Partia jako
+  jeden łańcuch z flush na ostatnim buforze. Ryzyko niskie-średnie.
+
+### 🟡 37. Globalne locki na liczniki przy każdym podłączeniu / odłączeniu (podnosi #21)
+
+- `stats_mutex` raz na licznik na subskrypcję (`stats.c:168-219` przez
+  420-427): 5 liczników `per=channel` × ~3 kanały = 15 przejęć na connect +
+  3 na disconnect (`stats.c:451-458`); w burzy ~60k/s na node. Do tego
+  `shpool->mutex` na `data->subscribers++` (`subscriber.c:663-665`) i `--`
+  (`utils.c:3035-3039`).
+- Poprawka: `data->subscribers` jako `ngx_atomic_t`; kubełki nigdy nie są
+  zwalniane, więc cache wskaźników per worker po (grupa, klucz) i
+  `ngx_atomic_fetch_add` na `active` / `total`, `stats_mutex` tylko przy
+  braku w cache. Ryzyko niskie.
+
+### 🟡 38. Dwa konkretne źródła wzrostu `r->pool` (doprecyzowuje #8)  częściowo sprawdzone
+
+- (a) `ngx_chain_update_chains` tylko przy `rc == NGX_OK`
+  (`utils.c:1903-1905`, sprawdzone): przy `NGX_AGAIN` (cokolwiek zostało w
+  buforze TLS) ogniwa i `ngx_buf_t` nie wracają do `ctx->free` i są alokowane
+  od nowa z `r->pool` (`utils.c:1869`). Snapshot 300 KB = ~74 bufory →
+  10-40 KB na connect, każda wiadomość do zaległego klienta mobilnego dokłada.
+  Poprawka: `update_chains` przy każdym `rc != NGX_ERROR`, jak rdzeń nginx.
+- (b) `to_send` = `ngx_pcalloc(r->pool, 8 × stored)` przy każdym wywołaniu
+  (`subscriber.c:774`): 4 KB na wywołanie, trzymane przez życie połączenia
+  (do 4 h), ~3 na świeży connect → ~240 MB na node przy 20k połączeń.
+  Poprawka: bufor wielokrotnego użytku per worker (użycie synchroniczne).
+
+### 🟡 39. `send_timeout` przestawiany przy każdej wiadomości; zaległy klient nigdy nie wypada  sprawdzone
+
+- `ngx_add_timer(wev, send_timeout)` przy każdym wywołaniu output filtra, gdy
+  połączenie jest zbuforowane (`utils.c:1907-1916`), i przy pingu co 21 s.
+  `send_timeout` liczy się więc od ostatniej wiadomości, nie od postępu
+  zapisu: klient z zerowym oknem TCP, który odpowiada na sondy (uśpiony
+  telefon), żyje do `subscriber_connection_ttl`. Łańcuch busy rośnie (O(k)
+  na każdą wysyłkę, ~120 B `r->pool` na wiadomość) i wskazuje zero-copy w shm,
+  które jest zwalniane 10 s po eksmisji → po wznowieniu klient dostaje śmieci
+  (błąd protokołu WS, reconnect).
+- Poprawka: timer tylko gdy `!wev->timer_set` (`flush_pending_output` i tak go
+  odnawia przy zdarzeniach zapisu) + limit zaległości (np. > 256 buforów lub
+  > 1 MB → finalize). Ryzyko niskie.
+
+### 🟡 40. 10 s grace dla buforów zero-copy za krótkie dla dużych snapshotów i wolnych klientów
+
+- Referencje startup / replay są zdejmowane zaraz po powrocie z wysyłki
+  (`subscriber.c:937`, `839-841`) bez przedłużenia `expires`; tylko ścieżka
+  IPC je przedłuża (`utils.c:2637-2639`). Podmieniona / eksmitowana wiadomość
+  jest zwalniana 10 s po wyrzuceniu, a wolny klient może jeszcze trzymać
+  bufory (`send_timeout` 60 s) → wysłanie ponownie użytej pamięci shm.
+- Poprawka: trzymać referencje w ctx i zwalniać po opróżnieniu `ctx->busy` /
+  przy sprzątaniu połączenia. Ryzyko średnie (każda ścieżka finalize musi
+  zwolnić). Razem z #39 zamyka klasę „wysyłka zwolnionego shm”.
+
+### 🟡 41. Wyścig census zaniża `channel->subscribers` → kanał z subskrybentami do kosza (use-after-free); walki census pod globalnymi lockami (podnosi #22)
+
+- Każdy init resetuje `slots_for_census` (`ipc.c:216-224`), a alerty census
+  idą do wszystkich (`ipc.c:195-199`): przy 32 startach ~528 census na
+  resetowanych licznikach; faza 3 (`ipc.c:439-465`) może przejść, gdy inny
+  worker jest między fazą 1 (zera) i 2. Zaniżony `channel->subscribers`
+  zostaje; kanał z 0, bez wiadomości i 20 min ciszy idzie cichą ścieżką do
+  kosza (`utils.c:2315-2336`) i jest zwalniany (`utils.c:2430-2450`) przy
+  żywych subskrypcjach - następne odłączenie pisze do zwolnionego shm.
+- Przy reloadzie ~1000 pełnych przejść kanałów pod globalnymi lockami
+  (`clean_worker_data` z blokującym `channel->mutex` na każdym kanale,
+  `ipc.c:293-298`; census `ipc.c:406-418`, `453-465`, pod `global_shpool`).
+- Poprawka: census jako delty per kanał pod `channel->mutex` (bez
+  `slots_for_census` i fazy 3), wzorzec snapshot + per kanał jak w #16;
+  niezależnie strażnik przed koszem: wszystkie wpisy workerów mają puste
+  `subscriptions`. Ryzyko niskie (strażnik) / średnie (census).
+
+### 🟡 42. Subskrypcja / publikacja do kanału, który właśnie idzie do kosza
+
+- Sweep sprawdza `subscribers == 0` / `stored_messages == 0` i ustawia
+  `deleted` tylko pod `channels_queue_mutex` (`utils.c:2319-2335`), a connect
+  (`subscriber.c:1004-1016`), `add_msg_to_channel` (`utils.c:1551`) i
+  `set_channel_startup_message` (`utils.c:1851`) nie sprawdzają `deleted` pod
+  `channel->mutex`. Skutek: zgubiona wiadomość / snapshot, wyciek, przy
+  subskrypcji use-after-free 10 s później. Publikacja z wolnym body (> 10 s)
+  pisze do zwolnionego shm (`publisher.c:100` vs `338/378`).
+- Poboczne: publikacja Startup-Message nie odświeża `channel->expires` -
+  kanał tylko ze snapshotami wypada po 20 min.
+- Poprawka: sweep ustawia `deleted` pod trylock `channel->mutex`; ścieżki
+  connect / publish sprawdzają `deleted` pod `channel->mutex` i ponawiają
+  przez `get_channel()`; `set_channel_startup_message` odświeża `expires`.
+  Ryzyko niskie, częstość niska.
+
+### 🟡 43. `clean_worker_data` opróżnia skrzynkę przed wypisaniem z kanałów  sprawdzone
+
+- `ipc.c:277-298`: najpierw drain, potem `unsubscribe_worker` po ~4,7k
+  kanałach (każdy z `channel->mutex`, milisekundy) - wiadomości wstawione w
+  tym czasie zostają w skrzynce starego slotu i trzymają referencje do
+  ponownego użycia slotu. Alert od workera tej samej generacji po cleanup →
+  `respond_to_subscribers` po zwolnionym wpisie. `unsubscribe_worker` kończy
+  na pierwszym dopasowaniu (`break`) - starsze wpisy tego slotu zostają.
+- Poprawka: najpierw wypisanie ze wszystkich kanałów (bez `break`), potem
+  drain, drugi drain na końcu. Ryzyko niskie.
+
+### 🟢 44. NULL deref przy pełnym shm  sprawdzone
+
+- `delete_channel` może zostawić `channel_deleted_message == NULL`
+  (`utils.c:2221-2226`), a `delete_channels_data` i tak woła
+  `send_response_message(..., NULL)` (`utils.c:765`), które go dereferuje →
+  SIGSEGV workera dokładnie w warunkach z 23.11 (`free_pages=0`). Poprawka:
+  pominąć wysyłkę przy NULL.
+
+### 🟢 45. `authorized_channels_only on` odrzuca kanał, który ma tylko startup message  sprawdzone
+
+- `subscriber.c:520-524` wymaga `stored_messages > 0`. Cichy kanał (np.
+  `tables-<id>`), którego wiadomości wygasły po 10 min, a snapshot wciąż jest,
+  daje 403 przy każdym connect przez do 20 min - może napędzać pętle
+  ponowień klienta. Poprawka: akceptować też `startup_message != NULL`.
+  Sprawdzić liczbę 403 na `/api/live/ws` w access logach.
+
+### 🟢 46. Drobne (niski wpływ, niskie ryzyko)
+
+- `channels_lock[64]` to spakowana tablica 16-bajtowych `ngx_shmtx_sh_t`
+  (`module.h:617-618`) - 4 muteksy w jednej linii cache (false sharing);
+  wyrównać do 64/128 B (zmiana układu shm = restart, nie reload).
+- Ping timer resetowany przy każdej dostawie do każdego subskrybenta
+  (`ipc.c:655-662`) mimo że w trybie application handler i tak pomija przez
+  `last_msg_sent` - pominąć w tym trybie.
+- Limit partii IPC liczy wiadomości, nie dostawy (`ipc.c:44`, `525`): 32
+  wiadomości na gorący kanał ze 100+ subskrybentami na worker = tysiące
+  writev w jednym przebiegu; `while(1)` w `channel_handler` powtarza partię
+  na każdy alert. Lepszy budżet czasu (np. 2 ms).
+- Odczyt WS obsługuje jedną ramkę na wybudzenie (`websocket.c:944-976`);
+  przy przerabianiu na pętlę przerwać po finalize w gałęzi DISCONNECT
+  (`websocket.c:224-226`), inaczej use-after-free.
+- Kubełki statystyk nigdy nie zwalniane, limit 50k na grupę - z `per=channel`
+  klucze rosną i po cichu wpadają do `__overflow__`.
+- `/api/live/lp` ma `gzip on` - ta sama wiadomość kompresowana osobno dla
+  każdego subskrybenta long-pollingu.
+
+### Plan etapów
+
+1. **`test31` - incydent i bezpieczeństwo pamięci (małe, niskie ryzyko):** #28
+   (a)+(b)+(c), #30, #31, #44, #29 (odmowa w workerze draining), #43. Test
+   lokalny z reloadem pod ruchem publikacji (każdy worker dostaje wiadomości,
+   kosz i stored schodzą po ciszy) + powtórka testu wycieku i benchmarku.
+2. **`test32` - koszt stały:** #32 (znacznik sweepu + `messages_pinned`), #38,
+   #39, #37, #34 (d).
+3. **Większe przebudowy, każda osobno z benchmarkiem:** #33 (zero-copy
+   szablony; wcześniej sprawdzić, czy szablon kopertowy jest potrzebny), #34
+   (a)-(c), #35, #36, #40, #41, #42, #45, #46.
 
 ---
 
