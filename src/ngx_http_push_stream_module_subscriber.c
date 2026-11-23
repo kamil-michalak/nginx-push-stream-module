@@ -825,9 +825,22 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
 
     /* take the reference BEFORE dropping the lock - see the function
        comment above for why this is what makes sending outside
-       channel->mutex, below, safe */
-    for (i = 0; i < to_send_count; i++) {
-        to_send[i]->workers_ref_count++;
+       channel->mutex, below, safe.
+       workers_ref_count is guarded by shpool->mutex, NOT channel->mutex:
+       every decrement (below, send_startup_message,
+       free_worker_message_memory) and the IPC fan-out increment
+       (send_worker_message) run under shpool->mutex in other processes,
+       so a ++ under channel->mutex alone is a lost-update race. A lost
+       decrement leaves the count > 0 forever and the message can never
+       leave the trash (shm exhausted on s1 2026-11-23); a lost increment
+       lets it be freed while still referenced. Order channel->mutex ->
+       shpool->mutex is the one broadcast() already uses. */
+    if (to_send_count > 0) {
+        ngx_shmtx_lock(&mcf->shpool->mutex);
+        for (i = 0; i < to_send_count; i++) {
+            to_send[i]->workers_ref_count++;
+        }
+        ngx_shmtx_unlock(&mcf->shpool->mutex);
     }
 
     ngx_shmtx_unlock(channel->mutex);
@@ -932,8 +945,12 @@ ngx_http_push_stream_send_startup_message(ngx_http_request_t *r, ngx_http_push_s
         }
     }
     /* see the long comment above this function for why this reference is
-       what makes sending outside channel->mutex, below, safe */
+       what makes sending outside channel->mutex, below, safe; under
+       shpool->mutex like every other workers_ref_count change (see
+       send_old_messages) */
+    ngx_shmtx_lock(&mcf->shpool->mutex);
     msg->workers_ref_count++;
+    ngx_shmtx_unlock(&mcf->shpool->mutex);
     ngx_shmtx_unlock(channel->mutex);
 
     ngx_http_push_stream_send_response_message(r, channel, msg, 0, ctx->message_sent);

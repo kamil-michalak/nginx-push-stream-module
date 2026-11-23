@@ -866,6 +866,51 @@ przycięciu powie, czy to `shpool->mutex`, czy mutex kanału / globalny lock
 z punktów 16–18 (te naprawia już `test26`). Instrumentacja locków (pkt 3
 planu) nadal najlepsza droga do pewności.
 
+### 27. `workers_ref_count++` pod `channel->mutex` - wiadomości na zawsze w koszu  ✅ NAPRAWIONE (branch `test30`)
+
+**Incydent 2026-11-23 (prod, kod `test29` w obrazie `nginx:test24`).** Na s1 od
+20:45 CET każda publikacja dostawała 500 (`slab alloc failed ... zone
+total=24432M, free_pages=0`), emit worker na s1 restartował się w pętli
+(#api-error-log). `messages_in_trash`: s1 4,75 mln, s2 1,83 mln, s3 ~5 tys.
+Kosz na s1/s2 rósł od 22.11 ok. 19:14 (Netdata `push.trash`), nie malał w
+ciszy. Naprawa doraźna: `docker rm -f` kontenera nginx-frontend na s1 (nowa
+strefa shm); s2 do restartu poza meczami.
+
+**Przyczyna:** `send_old_messages()` i `send_startup_message()` robiły
+`workers_ref_count++` tylko pod `channel->mutex`, a wszystkie `--`
+(`send_old_messages`, `send_startup_message`, `free_worker_message_memory`)
+i `++` z fan-outu IPC (`send_worker_message`) idą pod `shpool->mutex`. Dwa
+różne locki na tym samym polu w różnych procesach = zgubione aktualizacje.
+Zgubione `--` → licznik > 0 na zawsze → wiadomość nie wychodzi z kosza (sweep
+wymaga `workers_ref_count <= 0`), a zapisana wiadomość nie wygasa i trzyma
+kanał. Zgubione `++` → zwolnienie wiadomości, do której wskazuje jeszcze
+bufor wysyłki (use-after-free). Okno wyścigu otwiera każde podłączenie
+subskrybenta (startup message + replay), czyli burze reconnectów.
+
+**Poprawka:** oba `++` pod `shpool->mutex` (zagnieżdżony w `channel->mutex`,
+ta sama kolejność co `broadcast()` → `send_worker_message`; nigdzie nie ma
+odwrotnej kolejności).
+
+**Test lokalny** (nginx 1.31.9, 16 workerów z reuseport, `message_ttl 5s`, 4
+kanały, 8 publisherów, co 3. publikacja `Startup-Message: 1`, 300-600
+równoległych pętli krótkich subskrypcji stream; po obciążeniu 60 s ciszy):
+
+| przebieg | bez poprawki (`f6f8714`) | z poprawką |
+|---|---|---|
+| 30 s / 300 | trash 4 | trash 0 |
+| 30 s / 300 | trash 11 | trash 0 |
+| 60 s / 600 | trash 8 + 39 stored, 2 kanały nie znikają | wszystko 0 |
+
+Wszystkie buildy `-Werror -Wall`, bez alertów w logu.
+
+**Otwarte:** ten wyścig tłumaczy przeciek, ale nie to, dlaczego na s1/s2
+ruszył w jednej chwili (~34 min po reloadzie 22.11 18:40, przy `message_ttl
+10m`), a na s3 wcale. Przed restartem s1 miał 16 workerów po ~250
+subskrybentów i 16 po ~730 (s2/s3 równo) - możliwe, że część workerów
+przestała odbierać IPC. Do zbadania na s2 przed jego restartem. Pomogłyby
+metryki: długość kolejki IPC per worker w `by_worker` i liczba wiadomości w
+koszu z `workers_ref_count > 0` starszych niż kilka minut.
+
 ---
 
 ## Zmiany będące plusami przy tej skali (dla równowagi)
