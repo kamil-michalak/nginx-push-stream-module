@@ -1327,6 +1327,9 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     d->channels_in_delete = 0;
     d->channels_in_trash = 0;
     d->messages_in_trash = 0;
+    d->messages_pinned_count = 0;
+    d->last_pinned_sweep = 0;
+    d->last_sweep = 0;
     d->startup = ngx_time();
     d->last_message_time = 0;
     d->last_message_tag = 0;
@@ -1342,6 +1345,7 @@ ngx_http_push_stream_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     ngx_rbtree_init(&d->tree, sentinel, ngx_http_push_stream_rbtree_insert);
 
     ngx_queue_init(&d->messages_trash);
+    ngx_queue_init(&d->messages_pinned);
     ngx_queue_init(&d->channels_queue);
     ngx_queue_init(&d->channels_to_delete);
     ngx_queue_init(&d->channels_trash);

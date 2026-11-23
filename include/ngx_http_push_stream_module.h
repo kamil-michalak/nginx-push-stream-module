@@ -479,8 +479,8 @@ typedef struct {
     ngx_queue_t                                queue;   /* d->stats_queue - iteration / output */
     ngx_str_t                                  group;   /* copy in shared memory */
     ngx_str_t                                  key;     /* copy in shared memory */
-    ngx_uint_t                                 active;  /* currently-connected (gauge) - live inc/dec */
-    ngx_uint_t                                 total;   /* connections ever opened (monotonic) */
+    ngx_atomic_t                               active;  /* currently-connected (gauge) - live inc/dec, atomic */
+    ngx_atomic_t                               total;   /* connections ever opened (monotonic), atomic */
 } ngx_http_push_stream_stat_bucket_t;
 
 /* per-group key count, so the max_keys cap applies per group, not globally */
@@ -610,9 +610,9 @@ struct ngx_http_push_stream_shm_data_s {
     ngx_rbtree_t                            tree;
     ngx_uint_t                              channels;           // # of channels being used
     ngx_uint_t                              wildcard_channels;  // # of wildcard channels being used
-    ngx_uint_t                              published_messages; // # of published messagens in all channels
-    ngx_uint_t                              stored_messages;    // # of messages being stored
-    ngx_uint_t                              subscribers;        // # of subscribers in all channels
+    ngx_atomic_t                            published_messages; // # of published messagens in all channels (atomic, see NGX_HTTP_PUSH_STREAM_ATOMIC_SUB_SAT)
+    ngx_atomic_t                            stored_messages;    // # of messages being stored (atomic)
+    ngx_atomic_t                            subscribers;        // # of subscribers in all channels
     ngx_queue_t                             messages_trash;
     ngx_shmtx_t                             messages_trash_mutex;
     ngx_shmtx_sh_t                          messages_trash_lock;
@@ -627,7 +627,17 @@ struct ngx_http_push_stream_shm_data_s {
     ngx_shmtx_sh_t                          channels_to_delete_lock;
     ngx_uint_t                              channels_in_delete; // # of channels in to delete queue
     ngx_uint_t                              channels_in_trash;  // # of channels in trash queue
-    ngx_uint_t                              messages_in_trash;  // # of messages in trash queue
+    ngx_uint_t                              messages_in_trash;  // # of messages in trash queue (messages_pinned included)
+    /* expired trash entries still referenced (a slow send, a stalled inbox):
+       moved out of messages_trash so the sweep there can stop at the first
+       not-yet-expired entry, re-checked every NGX_HTTP_PUSH_STREAM_PINNED_SWEEP_SEC;
+       under messages_trash_mutex */
+    ngx_queue_t                             messages_pinned;
+    ngx_uint_t                              messages_pinned_count;
+    time_t                                  last_pinned_sweep;
+    /* last full cleanup sweep by any worker (under cleanup_mutex): every
+       worker's 4 s timer used to run it, ~8 full sweeps/s per node */
+    time_t                                  last_sweep;
     ngx_http_push_stream_worker_data_t      ipc[NGX_MAX_PROCESSES]; // interprocess stuff
     time_t                                  startup;
     time_t                                  last_message_time;
@@ -862,6 +872,29 @@ static const ngx_str_t  NGX_HTTP_PUSH_STREAM_ALLOWED_HEADERS = ngx_string("If-Mo
 
 #define NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER_BY(counter, qtd) \
     (counter = (counter > qtd) ? counter - qtd : 0)
+
+/*
+ * Zone-wide counters changed from every worker (data->published_messages,
+ * stored_messages, subscribers; stat bucket active / total): atomic instead
+ * of a global mutex per change. Decrements saturate at 0 like
+ * NGX_HTTP_PUSH_STREAM_DECREMENT_COUNTER - census and ?reset=active store
+ * plain values into some of them, so a decrement may find less than it
+ * expects.
+ */
+static ngx_inline void
+ngx_http_push_stream_atomic_sub_sat(ngx_atomic_t *p, ngx_atomic_uint_t n)
+{
+    ngx_atomic_uint_t  old;
+
+    do {
+        old = *p;
+        if (old == 0) {
+            return;
+        }
+    } while (!ngx_atomic_cmp_set(p, old, (old > n) ? old - n : 0));
+}
+#define NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(p, n)       (void) ngx_atomic_fetch_add((p), (n))
+#define NGX_HTTP_PUSH_STREAM_ATOMIC_SUB_SAT(p, n)   ngx_http_push_stream_atomic_sub_sat((p), (n))
 
 #define NGX_HTTP_PUSH_STREAM_TIME_FMT_LEN   30 //sizeof("Mon, 28 Sep 1970 06:00:00 GMT")
 

@@ -35,6 +35,8 @@
 #include <ngx_http_push_stream_module_websocket.h>
 
 #define NGX_HTTP_PUSH_STREAM_MESSAGE_BUFFER_CLEANUP_INTERVAL                5000     // 5 seconds
+#define NGX_HTTP_PUSH_STREAM_SHM_SWEEP_MIN_SEC                              3        // full cleanup sweep at most this often per zone
+#define NGX_HTTP_PUSH_STREAM_PINNED_SWEEP_SEC                               30       // re-check of expired but referenced trash entries
 static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_OBJECTS_TTL = 10;      // 10 seconds
 static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_SHM_MEMORY_CLEANUP_INTERVAL    = 4000;    // 4 seconds
 static time_t NGX_HTTP_PUSH_STREAM_DEFAULT_MESSAGE_TTL                    = 1800;    // 30 minutes

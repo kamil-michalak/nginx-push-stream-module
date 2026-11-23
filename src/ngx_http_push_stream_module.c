@@ -114,16 +114,16 @@ ngx_http_push_stream_send_response_all_channels_info_summarized(ngx_http_request
     }
     *start = '\0';
 
-    // 9 original numeric counters + 7 shm_* fields = 16;
-    // minus 24 sprintf (literal "%s"/"%ui" placeholder chars already counted via format_summarized->len)
-    len = 16*NGX_INT_T_LEN + subtype->format_summarized->len + hostname->len + currenttime->len + ngx_strlen(subscribers_by_workers) - 24;
+    // 9 original numeric counters + messages_pinned + 7 shm_* fields = 17;
+    // minus 27 sprintf (literal "%s"/"%ui" placeholder chars already counted via format_summarized->len)
+    len = 17*NGX_INT_T_LEN + subtype->format_summarized->len + hostname->len + currenttime->len + ngx_strlen(subscribers_by_workers) - 27;
 
     if ((text = ngx_http_push_stream_create_str(r->pool, len)) == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Failed to allocate response buffer.");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_sprintf(text->data, (char *) subtype->format_summarized->data, hostname->data, currenttime->data, data->channels, data->wildcard_channels, data->published_messages, data->stored_messages, data->messages_in_trash, data->channels_in_delete, data->channels_in_trash, data->subscribers, ngx_time() - data->startup, shm_zone_total_mb, shm_gauge->free_pages, shm_free_mb, shm_pagesize, shm_gauge->free_runs, shm_largest_free_run_kb, (ngx_uint_t) shm_gauge->capped, subscribers_by_workers);
+    ngx_sprintf(text->data, (char *) subtype->format_summarized->data, hostname->data, currenttime->data, data->channels, data->wildcard_channels, data->published_messages, data->stored_messages, data->messages_in_trash, data->messages_pinned_count, data->channels_in_delete, data->channels_in_trash, data->subscribers, ngx_time() - data->startup, shm_zone_total_mb, shm_gauge->free_pages, shm_free_mb, shm_pagesize, shm_gauge->free_runs, shm_largest_free_run_kb, (ngx_uint_t) shm_gauge->capped, subscribers_by_workers);
     text->len = ngx_strlen(text->data);
 
     return ngx_http_push_stream_send_response(r, text, subtype->content_type, NGX_HTTP_OK);

@@ -628,7 +628,6 @@ ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_st
     ngx_http_push_stream_worker_data_t             *thisworker_data = &data->ipc[ngx_process_slot];
     ngx_msec_t                                      connection_ttl = worker_subscriber->longpolling ? cf->longpolling_connection_ttl : cf->subscriber_connection_ttl;
     ngx_http_push_stream_module_ctx_t              *ctx = ngx_http_get_module_ctx(r, ngx_http_push_stream_module);
-    ngx_slab_pool_t                                *shpool = mcf->shpool;
 
     // adding subscriber to worker list of subscribers
     ngx_queue_insert_tail(&thisworker_data->subscribers_queue, &worker_subscriber->worker_queue);
@@ -665,10 +664,8 @@ ngx_http_push_stream_registry_subscriber(ngx_http_request_t *r, ngx_http_push_st
         }
     }
 
-    // increment global subscribers count
-    ngx_shmtx_lock(&shpool->mutex);
-    data->subscribers++;
-    ngx_shmtx_unlock(&shpool->mutex);
+    // increment global subscribers count (atomic, see NGX_HTTP_PUSH_STREAM_ATOMIC_SUB_SAT)
+    NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(&data->subscribers, 1);
     thisworker_data->subscribers++;
 
     // dimension counters (push_stream_stat_counter) - resolve keys once, bump gauges
@@ -754,6 +751,9 @@ ngx_http_push_stream_has_old_messages_to_send(ngx_http_push_stream_channel_t *ch
  * mechanism - it is respected everywhere a message is thrown away, not just
  * for startup messages).
  */
+/* replay pointer array, see ngx_http_push_stream_send_old_messages() */
+static ngx_http_push_stream_ptr_buf_t  ngx_http_push_stream_replay_buf;
+
 static void
 ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stream_channel_t *channel, ngx_uint_t backtrack, time_t if_modified_since, ngx_int_t tag, time_t greater_message_time, ngx_int_t greater_message_tag, ngx_str_t *last_event_id)
 {
@@ -769,21 +769,32 @@ ngx_http_push_stream_send_old_messages(ngx_http_request_t *r, ngx_http_push_stre
         return;
     }
 
-    /* upper bound for the batch - re-read under the lock below too, since
-       this pre-lock value can be stale by the time we actually walk; the
-       collection loops also stop at to_send_max defensively either way */
-    to_send_max = channel->stored_messages;
-    if (to_send_max == 0) {
+    if (channel->stored_messages == 0) {
         return;
     }
 
-    to_send = ngx_pcalloc(r->pool, sizeof(ngx_http_push_stream_msg_t *) * to_send_max);
-    if (to_send == NULL) {
+    /* One per-worker array for every call instead of
+       ngx_pcalloc(r->pool, 8 x stored) each time: that was ~4 KB per call
+       (512 stored), kept for the connection's whole life, ~3 per fresh
+       connect (#38). Only used synchronously below - collected, sent, then
+       unreferenced - so reuse across requests is safe in a single-threaded
+       worker. Sized before the lock with headroom and re-checked under it,
+       so the newest messages are not cut off when the channel grew in
+       between (the pre-lock count used to cap the batch). */
+    if (ngx_http_push_stream_ptr_buf_reserve(&ngx_http_push_stream_replay_buf, channel->stored_messages + 16) != NGX_OK) {
         return;   /* fail closed, same as any other allocation failure on this path */
     }
     to_send_count = 0;
 
     ngx_shmtx_lock(channel->mutex);
+
+    if ((channel->stored_messages > ngx_http_push_stream_replay_buf.nalloc)
+        && (ngx_http_push_stream_ptr_buf_reserve(&ngx_http_push_stream_replay_buf, channel->stored_messages) != NGX_OK)) {
+        ngx_shmtx_unlock(channel->mutex);
+        return;
+    }
+    to_send = (ngx_http_push_stream_msg_t **) ngx_http_push_stream_replay_buf.elts;
+    to_send_max = ngx_http_push_stream_replay_buf.nalloc;
 
     if (backtrack > 0) {
         ngx_uint_t qtd = (backtrack > channel->stored_messages) ? channel->stored_messages : backtrack;

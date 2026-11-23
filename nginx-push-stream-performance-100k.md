@@ -1048,7 +1048,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   chodzi po `msg->queue` po zwolnieniu locka. Ryzyko niskie (sprawdzić
   pozostałe wywołania).
 
-### 🟠 32. Sweep sprzątający ~8×/s na node zamiast co 4 s; kosz chodzony w całości pod `messages_trash_mutex`  sprawdzone
+### 🟠 32. Sweep sprzątający ~8×/s na node zamiast co 4 s; kosz chodzony w całości pod `messages_trash_mutex`  sprawdzone  ✅ NAPRAWIONE (etap 2)
 
 - Każdy z 32 workerów ma `memory_cleanup` co 4 s i `buffer_cleanup` co 5 s
   (`utils.c:2454-2490`, `setup.h:37-39`); `trylock(cleanup_mutex)` chroni
@@ -1091,7 +1091,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   szablon z poziomu http (2 szablony mniej). Ryzyko średnie (wszystkie ścieżki
   wysyłki).
 
-### 🟠 34. `shpool->mutex` ~15 + 2W razy na publikację, głównie pod `channel->mutex` (podnosi #24)
+### 🟠 34. `shpool->mutex` ~15 + 2W razy na publikację, głównie pod `channel->mutex` (podnosi #24)  (d) ✅ liczniki (etap 2), (a)-(c) otwarte
 
 - Osobne samoblokujące alokacje: struktura msg, 4 tablice, event id
   (wartość + wiadomość, `utils.c:909/925`), każda kopia szablonu, ref surowej
@@ -1144,7 +1144,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   rozstrzyga FOUND/NOT_FOUND i zbiera; pre-check używa wyniku. Partia jako
   jeden łańcuch z flush na ostatnim buforze. Ryzyko niskie-średnie.
 
-### 🟡 37. Globalne locki na liczniki przy każdym podłączeniu / odłączeniu (podnosi #21)
+### 🟡 37. Globalne locki na liczniki przy każdym podłączeniu / odłączeniu (podnosi #21)  ✅ NAPRAWIONE (etap 2)
 
 - `stats_mutex` raz na licznik na subskrypcję (`stats.c:168-219` przez
   420-427): 5 liczników `per=channel` × ~3 kanały = 15 przejęć na connect +
@@ -1156,7 +1156,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   `ngx_atomic_fetch_add` na `active` / `total`, `stats_mutex` tylko przy
   braku w cache. Ryzyko niskie.
 
-### 🟡 38. Dwa konkretne źródła wzrostu `r->pool` (doprecyzowuje #8)  częściowo sprawdzone
+### 🟡 38. Dwa konkretne źródła wzrostu `r->pool` (doprecyzowuje #8)  częściowo sprawdzone  ✅ NAPRAWIONE (etap 2)
 
 - (a) `ngx_chain_update_chains` tylko przy `rc == NGX_OK`
   (`utils.c:1903-1905`, sprawdzone): przy `NGX_AGAIN` (cokolwiek zostało w
@@ -1169,7 +1169,7 @@ reszta z raportów (z numerami linii, do potwierdzenia przy poprawce).
   (do 4 h), ~3 na świeży connect → ~240 MB na node przy 20k połączeń.
   Poprawka: bufor wielokrotnego użytku per worker (użycie synchroniczne).
 
-### 🟡 39. `send_timeout` przestawiany przy każdej wiadomości; zaległy klient nigdy nie wypada  sprawdzone
+### 🟡 39. `send_timeout` przestawiany przy każdej wiadomości; zaległy klient nigdy nie wypada  sprawdzone, odtworzone  ✅ NAPRAWIONE (etap 2, bez limitu zaległości)
 
 - `ngx_add_timer(wev, send_timeout)` przy każdym wywołaniu output filtra, gdy
   połączenie jest zbuforowane (`utils.c:1907-1916`), i przy pingu co 21 s.
@@ -1352,6 +1352,43 @@ pomiarach z #27, ale porównanie jest w parach).
 restart kontenera nginx-frontend, nie reload. Po wdrożeniu: `inbox_recovered`
 i log „could not wake worker” / „wake-up was lost” pokażą, jak często to się
 działo.
+
+### Etap 2 - wynik (2026-11-23, working tree po `4bc5054`)
+
+**Zmiany:**
+- **#32:**
+  - `data->last_sweep` pod `cleanup_mutex`: pełny sweep (usunięte kanały, wygasanie, kosz) najwyżej raz na `NGX_HTTP_PUSH_STREAM_SHM_SWEEP_MIN_SEC` (3 s) na strefę, zamiast przy każdym z 32 timerów; `delete_channels_data` dalej w każdym workerze (finalizuje jego subskrybentów).
+  - `buffer_cleanup` wygasza tylko wtedy, gdy nikt nie sweepował od 3 s.
+  - Kosz: wygasła i bez referencji → zwolnienie; wygasła z referencją → nowa kolejka `messages_pinned`; jeszcze niewygasła → koniec przejścia (reszta młodsza, najwyżej o grace TTL poza kolejnością).
+  - `messages_pinned` sprawdzane co `NGX_HTTP_PUSH_STREAM_PINNED_SWEEP_SEC` (30 s) i wystawione w statystykach (`messages_pinned`, 4 formaty); `messages_in_trash` liczy obie kolejki.
+- **#38:**
+  - (a) `ngx_chain_update_chains` przy każdym `rc != NGX_ERROR`.
+  - (b) tablica replayu jako bufor per worker (`ptr_buf`), z rozmiarem sprawdzanym ponownie pod lockiem - przy okazji koniec obcinania najnowszych wiadomości z #35.
+- **#39:**
+  - Timer zapisu odnawiany tylko na ścieżce flush (zdarzenie zapisu = postęp) albo gdy nie jest ustawiony.
+  - **Pułapka znaleziona przy teście:** `ngx_chain_update_chains(..., &in, ...)` zeruje `in`, więc po #38 (a) warunek `in == NULL` był zawsze prawdziwy i timer dalej przesuwał się przy każdej wiadomości. Flaga `flush_only` jest liczona przed filtrem.
+  - Limitu zaległości (256 buforów / 1 MB) nie dodałem: przy działającym `send_timeout` zaległość jest ograniczona do ~`send_timeout` wiadomości.
+- **#37:**
+  - `data->subscribers` atomowy, z nasycającą dekrementacją przez CAS.
+  - Kolejka i licznik subskrybentów workera bez `shpool->mutex` (należą do właściciela).
+  - `active` / `total` kubełków `stat_counter` atomowe.
+  - Odłączenie bez `stats_mutex`.
+  - Podłączenie przez cache per worker (16k wpisów, 4 próby, nadpisanie przy pełnym; kubełki nigdy nie są zwalniane, więc wskaźnik żyje tyle co strefa). `stats_mutex` tylko przy chybieniu.
+- **#34 (d):** `published_messages` / `stored_messages` atomowe - koniec globalnego `channels_queue_mutex` przy każdej publikacji. Para `last_message_time` / `tag` zostaje pod `shpool->mutex` (wymaga spójnej zmiany dwóch pól).
+
+**Testy** (nginx 1.31.9, `-Werror -Wall`, `s31` = `4bc5054`, `s32` = etap 2):
+
+| test | `s31` | `s32` |
+|---|---|---|
+| klient bez czytania (`SO_RCVBUF` 4 KB), 20 KB × 20/s, `send_timeout 5s`, ping 1 s | nie odłączony w 40 s | odłączony po ~10 s (bufory + 5 s), „client timed out” |
+| RSS workerów, 1500 trzymanych połączeń, snapshot 20 KB + replay 512 | +14,0 KB / połączenie | **+9,6 KB / połączenie** (−31%, 2 przebiegi) |
+| `stat_counter` (zwykły + `per=channel`), 3 rundy × 300 podłączeń | active 300 → 0, total 300/600/900 | identycznie (rundy 2-3 przez cache) |
+| wyciek (#27), 30 s / 300 i 60 s / 600 | - | wszystko 0 |
+| okno reloadu (#28), 4 próby | - | 0 głuchych |
+
+Benchmark (4 workery na 3 rdzeniach, 5 liczników `per=channel` jak na prod, 4 rundy): `s31` 10 544 pub/s / 7 405 podłączeń/s, `s32` 11 186 / 7 327 - w szumie, host bardzo niestabilny (ta sama wersja 5,8k-15k pub/s między rundami). Zysk etapu 2 to mniej przejęć globalnych locków, co rośnie z liczbą workerów, i pamięć; przy 4 workerach lokalnie tego nie widać.
+
+**Wdrożenie:** zmienia się układ shm (`messages_pinned`, `last_sweep`, typy liczników), więc pełny restart kontenera, nie reload.
 
 ### Plan etapów
 

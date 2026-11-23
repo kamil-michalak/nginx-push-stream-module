@@ -149,6 +149,78 @@ ngx_http_push_stream_stat_group_get(ngx_http_push_stream_shm_data_t *d, ngx_slab
  * and nothing ever takes them the other way round). Returns the bucket, or NULL
  * on shared-memory exhaustion. `max_keys` is applied PER GROUP.
  */
+/*
+ * Per-worker cache (group, key) -> bucket, so a connect bumps its counters
+ * with two atomic adds instead of taking the zone-wide stats_mutex once per
+ * counter per subscription (5 per=channel counters x ~3 channels = 15
+ * acquisitions per connect in prod, #37 of the 2026-11-23 review). Buckets are
+ * never freed and their group / key copies never change, so a cached pointer
+ * stays valid for the life of the zone (reload included). Open addressing,
+ * a few probes, overwrite when full: a miss is just the locked path.
+ */
+#define NGX_HTTP_PUSH_STREAM_STAT_CACHE_SIZE    16384   /* power of 2 */
+#define NGX_HTTP_PUSH_STREAM_STAT_CACHE_PROBES  4
+
+typedef struct {
+    ngx_http_push_stream_shm_data_t     *d;
+    ngx_http_push_stream_stat_bucket_t  *b;
+    uint32_t                             crc;
+} ngx_http_push_stream_stat_cache_entry_t;
+
+static ngx_http_push_stream_stat_cache_entry_t  *ngx_http_push_stream_stat_cache = NULL;
+
+static ngx_inline ngx_flag_t
+ngx_http_push_stream_stat_cache_match(ngx_http_push_stream_stat_cache_entry_t *e, ngx_http_push_stream_shm_data_t *d,
+    uint32_t crc, ngx_str_t *group, ngx_str_t *key)
+{
+    return (e->b != NULL) && (e->d == d) && (e->crc == crc)
+        && (e->b->group.len == group->len) && (e->b->key.len == key->len)
+        && (ngx_memcmp(e->b->group.data, group->data, group->len) == 0)
+        && (ngx_memcmp(e->b->key.data, key->data, key->len) == 0);
+}
+
+static ngx_http_push_stream_stat_bucket_t *
+ngx_http_push_stream_stat_cache_get(ngx_http_push_stream_shm_data_t *d, uint32_t crc, ngx_str_t *group, ngx_str_t *key)
+{
+    ngx_uint_t  i, idx;
+
+    if (ngx_http_push_stream_stat_cache == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < NGX_HTTP_PUSH_STREAM_STAT_CACHE_PROBES; i++) {
+        idx = (crc + i) & (NGX_HTTP_PUSH_STREAM_STAT_CACHE_SIZE - 1);
+        if (ngx_http_push_stream_stat_cache_match(&ngx_http_push_stream_stat_cache[idx], d, crc, group, key)) {
+            return ngx_http_push_stream_stat_cache[idx].b;
+        }
+    }
+    return NULL;
+}
+
+static void
+ngx_http_push_stream_stat_cache_put(ngx_http_push_stream_shm_data_t *d, uint32_t crc, ngx_http_push_stream_stat_bucket_t *b)
+{
+    ngx_uint_t  i, idx;
+
+    if (ngx_http_push_stream_stat_cache == NULL) {
+        ngx_http_push_stream_stat_cache = ngx_calloc(NGX_HTTP_PUSH_STREAM_STAT_CACHE_SIZE * sizeof(ngx_http_push_stream_stat_cache_entry_t), ngx_cycle->log);
+        if (ngx_http_push_stream_stat_cache == NULL) {
+            return;
+        }
+    }
+    for (i = 0; i < NGX_HTTP_PUSH_STREAM_STAT_CACHE_PROBES; i++) {
+        idx = (crc + i) & (NGX_HTTP_PUSH_STREAM_STAT_CACHE_SIZE - 1);
+        if (ngx_http_push_stream_stat_cache[idx].b == NULL) {
+            break;
+        }
+    }
+    if (i == NGX_HTTP_PUSH_STREAM_STAT_CACHE_PROBES) {
+        idx = crc & (NGX_HTTP_PUSH_STREAM_STAT_CACHE_SIZE - 1);
+    }
+    ngx_http_push_stream_stat_cache[idx].d = d;
+    ngx_http_push_stream_stat_cache[idx].b = b;
+    ngx_http_push_stream_stat_cache[idx].crc = crc;
+}
+
 static ngx_http_push_stream_stat_bucket_t *
 ngx_http_push_stream_stat_bucket_touch(ngx_http_push_stream_shm_data_t *d, ngx_slab_pool_t *shpool,
     ngx_str_t *group, ngx_str_t *key, ngx_uint_t max_keys)
@@ -161,6 +233,12 @@ ngx_http_push_stream_stat_bucket_touch(ngx_http_push_stream_shm_data_t *d, ngx_s
 
     crc = ngx_crc32_long(group->data, group->len);
     crc ^= ngx_crc32_long(key->data, key->len);
+
+    if ((b = ngx_http_push_stream_stat_cache_get(d, crc, group, key)) != NULL) {
+        NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(&b->active, 1);
+        NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(&b->total, 1);
+        return b;
+    }
 
     is_overflow = (key->len == NGX_HTTP_PUSH_STREAM_STAT_OVERFLOW_KEY.len)
         && (ngx_memcmp(key->data, NGX_HTTP_PUSH_STREAM_STAT_OVERFLOW_KEY.data, key->len) == 0);
@@ -213,10 +291,18 @@ ngx_http_push_stream_stat_bucket_touch(ngx_http_push_stream_shm_data_t *d, ngx_s
         g->nkeys++;
     }
 
-    b->active++;
-    b->total++;
+    /* atomic even under stats_mutex: the cached fast path above and the
+       unregister paths change them without it */
+    NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(&b->active, 1);
+    NGX_HTTP_PUSH_STREAM_ATOMIC_ADD(&b->total, 1);
 
     ngx_shmtx_unlock(&d->stats_mutex);
+
+    /* cache only an exact (group, key) bucket - an __overflow__ fallback has
+       another key and would never match anyway */
+    if ((b->key.len == key->len) && (ngx_memcmp(b->key.data, key->data, key->len) == 0)) {
+        ngx_http_push_stream_stat_cache_put(d, crc, b);
+    }
     return b;
 }
 
@@ -448,14 +534,13 @@ ngx_http_push_stream_stat_subscription_unregister(ngx_http_push_stream_subscript
     mcf = ngx_http_get_module_main_conf(subscription->subscriber->request, ngx_http_push_stream_module);
     d = mcf->shm_data;
 
-    ngx_shmtx_lock(&d->stats_mutex);
+    (void) d;
     for (i = 0; i < subscription->stat_buckets_n; i++) {
         b = subscription->stat_buckets[i];
-        if ((b != NULL) && (b->active > 0)) {
-            b->active--;
+        if (b != NULL) {
+            NGX_HTTP_PUSH_STREAM_ATOMIC_SUB_SAT(&b->active, 1);
         }
     }
-    ngx_shmtx_unlock(&d->stats_mutex);
 
     subscription->stat_buckets = NULL;
     subscription->stat_buckets_n = 0;
@@ -477,14 +562,13 @@ ngx_http_push_stream_stat_unregister(ngx_http_push_stream_subscriber_t *sub)
     mcf = ngx_http_get_module_main_conf(sub->request, ngx_http_push_stream_module);
     d = mcf->shm_data;
 
-    ngx_shmtx_lock(&d->stats_mutex);
+    (void) d;
     for (i = 0; i < sub->stat_buckets_n; i++) {
         b = sub->stat_buckets[i];
-        if ((b != NULL) && (b->active > 0)) {
-            b->active--;
+        if (b != NULL) {
+            NGX_HTTP_PUSH_STREAM_ATOMIC_SUB_SAT(&b->active, 1);
         }
     }
-    ngx_shmtx_unlock(&d->stats_mutex);
 
     sub->stat_buckets = NULL;
     sub->stat_buckets_n = 0;
